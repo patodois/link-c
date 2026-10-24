@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unix:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the demo, the examples and the tests
+        run: make
+      - name: Unit tests
+        run: make test
+      - name: Unit tests under AddressSanitizer and UndefinedBehaviorSanitizer
+        run: make asan
+      - name: Compile and use the header from C++
+        run: make cxx
+      - name: Demo host and guest against each other (pixel file with depth, 400-chunk collision snapshot)
+        run: tests/interop.sh c
+        env:
+          RBL_DEMO: build/demo
+
+  windows:
+    name: windows-latest (MSVC)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -A x64
+      - name: Build (Release)
+        run: cmake --build build --config Release
+      - name: Unit tests
+        run: ctest --test-dir build -C Release --output-on-failure
