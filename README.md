@@ -203,6 +203,8 @@ tests/interop.sh
   written against the documentation and syntax-checked against stand-in headers, **not compiled with MSVC or run
   on Windows**; the CI workflow builds and tests it there, but this repository has not been pushed, so it has not
   run yet. GCC on Linux has not been tried either.
+- Winsock: each link calls `WSAStartup` and, when it is closed, `WSACleanup`; Windows counts them. If your own code uses sockets, hold your own `WSAStartup`
+  reference (any game that uses Winsock does), or the last `rbl_link_close()` shuts Winsock down under your sockets.
 - Big-endian hosts: the datagram and JSON codecs are byte-order clean; the pixel file path swaps the lock word and
   depth floats but has not been run.
 - Strings that you pass in must be UTF-8 (invalid sequences are replaced by U+FFFD). `game` is cut at 255 bytes,
