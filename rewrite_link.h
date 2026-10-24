@@ -90,7 +90,7 @@ extern "C" {
 #define RBLDEF extern
 #endif
 
-#define REWRITE_LINK_VERSION "0.1.0"
+#define REWRITE_LINK_VERSION "0.1.1"
 
 /* ------------------------------------------------------------------------------------------
  * Constants and layouts (CONTRACT.md section 10)
@@ -2596,7 +2596,7 @@ static void rbli_poll_control(rbl_link* l, uint64_t now) {
         int bye, r;
         if (!rbli_room(l)) return; /* the caller's array is full: the rest waits for the next poll */
         r = rbli_ctl_next_line(c, &line, &len);
-        if (r < 0) { rbli_end(l, c->fatal, 0); return; }
+        if (r < 0) { rbli_end(l, c->fatal, 1); return; } /* a protocol error: tell the peer (CONTRACT 8, 6.1) */
         if (r == 0) break;
         l->stats.lines_received++;
         if (rbli_on_line(l, line, len, now, reason, sizeof reason, &bye) != 0) {

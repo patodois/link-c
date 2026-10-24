@@ -59,15 +59,6 @@
 
 /* Vectors this implementation fails: { id, why }, the list ends with { NULL, NULL }. */
 static const struct { const char* id; const char* why; } KNOWN_DISAGREEMENTS[] = {
-    { "sess.host.control.invalid_utf8_ends_session",
-      "rbli_poll_control ends the session with rbli_end(l, c->fatal, 0) when rbli_ctl_next_line fails, and bye=0 writes no bye: "
-      "the connection is closed with no line. Section 8 says control lines are UTF-8 and that a line that is not a JSON object "
-      "with a string type is a protocol error answered with bye; 6.1 says every close for a protocol error writes the bye first" },
-    { "sess.host.control.line_of_65537_bytes_ends_session",
-      "same path (rbli_ctl_next_line sets fatal \"control line too long\", rbli_end(..., 0)): the session ends but without a bye. "
-      "Section 8: a longer line \"is a protocol error and ends the session\"; 6.1: a close for a protocol error writes bye first" },
-    { "sess.host.control.65536_bytes_without_newline_ends_session",
-      "same path (65536 bytes buffered without a newline, avail >= RBL_MAX_LINE): ends without a bye, see the 65537 byte case" },
     { NULL, NULL }
 };
 
