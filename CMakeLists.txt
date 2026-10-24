@@ -40,10 +40,22 @@ target_link_libraries(guest_example PRIVATE rewrite_link)
 add_executable(test_link tests/test_link.c)
 target_link_libraries(test_link PRIVATE rewrite_link Threads::Threads)
 
+# the shared test vectors (tests/vectors/link): needs the working directory to be the repository root, or
+# RBL_VECTORS_DIR; the compiled-in default below covers running the executable from anywhere
+add_executable(test_vectors tests/test_vectors.c)
+target_link_libraries(test_vectors PRIVATE rewrite_link Threads::Threads)
+target_compile_definitions(test_vectors PRIVATE
+  "RBL_VECTORS_DEFAULT_DIR=\"${CMAKE_CURRENT_SOURCE_DIR}/tests/vectors/link\"")
+
+# one side of the cross-language interop session (rewrite-bridge: tests/interop/README.md)
+add_executable(interop_peer tests/interop_peer.c)
+target_link_libraries(interop_peer PRIVATE rewrite_link)
+
 # the header must also compile as C++ (the plugins this is for are mostly C++)
 add_executable(cxx_check tests/cxx_check.cpp tests/cxx_other.cpp)
 target_link_libraries(cxx_check PRIVATE rewrite_link)
 
 enable_testing()
 add_test(NAME unit COMMAND test_link)
+add_test(NAME vectors COMMAND test_vectors WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME cxx COMMAND cxx_check)

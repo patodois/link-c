@@ -165,8 +165,8 @@ A plugin is usually 64-bit; 32-bit x86 is not a target (a 64-bit atomic load on 
 ## Build and test
 
 ```
-make            # build/demo, build/host_example, build/guest_example, build/test_link   (macOS, Linux)
-make test       # the unit tests
+make            # build/demo, build/host_example, build/guest_example, build/test_link, build/test_vectors, build/interop_peer   (macOS, Linux)
+make test       # the unit tests and the shared test vectors
 make asan       # the same under -fsanitize=address,undefined
 make cxx        # the header, with its implementation, as C++11
 cmake -S . -B build && cmake --build build && ctest --test-dir build      # also Windows (MSVC)
@@ -180,7 +180,45 @@ addresses, small event arrays, the allocation count), every revision 4 case, and
 (a writer thread lapping a two-slot file against a reader thread; it also shows that the same copy without the
 lock check does tear).
 
+## Shared test vectors
+
+`tests/vectors/link/` holds test vectors for the link protocol that all four implementations (Rust in
+rewrite-bridge, `link-java`, this one, `link-cs`) run in their own test suites: control lines to decode, ignore,
+reject or encode, UDP datagrams as hex, pixel files to open, read and write, and scripted sessions over real
+sockets against one side of the link. They are derived from `docs/CONTRACT.md` alone, with an encoder of their own,
+so a vector that this implementation fails is a place where it disagrees with the contract. The directory is a
+copy of rewrite-bridge's `tests/vectors/link/` (without `gen.py`); `README.md` and `GAPS.md` in it describe the
+formats and what the contract leaves open. Do not edit the copy.
+
+`tests/test_vectors.c` runs them (`make test`, `make asan`, or `ctest -R vectors`; about 30 seconds, most of it
+sessions that wait on timers). It checks every file against `SHA256SUMS`, and `SHA256SUMS` itself against the
+constant `VECTORS_DIGEST` in the source, so the vectors can only change together with a deliberate edit of that
+constant. Vectors this implementation is known to fail are listed with the reason in `KNOWN_DISAGREEMENTS` at the
+top of the file: they are reported but do not fail the run, and one that starts passing does. The runner finds the
+vectors in `$RBL_VECTORS_DIR`, else `tests/vectors/link` (also `../tests/vectors/link`) relative to the working
+directory; `RBL_VECTORS_SKIP_LARGE=1` skips the cases that need a sparse file of up to 1 GiB.
+
+To update the copy, run `scripts/sync-link-vectors.sh <path of this repository>` in the rewrite-bridge repository.
+It copies the directory, keeps the `tests/vectors/link/** -text` line in `.gitattributes` (the files must stay byte
+for byte), and prints `VECTORS_DIGEST = <hex>`: paste the hex into `tests/test_vectors.c`, run `make test`, and
+revisit `KNOWN_DISAGREEMENTS`.
+
 ## Interop
+
+`tests/interop_peer.c` is this implementation's side of rewrite-bridge's cross-language interop matrix
+(`tests/interop/README.md` there): one process plays the host or the guest of a scripted session (handshake, spawn
+and focus, five lock-step rounds of camera, poses, collision and frames through a real pixel file with depth,
+despawn, bye) and prints a result line the driver there judges.
+
+```
+make build/interop_peer
+build/interop_peer host  --port 47810 --label c &
+build/interop_peer guest --port 47810 --label c
+```
+
+The last line on stdout is `RBL-INTEROP-RESULT {json}`; the exit status is 0 if every check passed, 1 if one failed,
+2 for a bad command line. rewrite-bridge's `tests/interop/run.sh` starts it with `RBL_PEER_C="build/interop_peer"`
+(or builds it with `make build/interop_peer` for you when you pass `--build`).
 
 `tests/interop.sh` runs the demo against the Rust `fake_host` / `fake_guest` examples and link-java's `LinkDemo`,
 in both roles, each pair twice: with the guest rendering a 320x240 frame with a depth plane for every camera, and

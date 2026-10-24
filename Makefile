@@ -1,8 +1,9 @@
 # Plain Makefile for macOS and Linux. Windows: use CMake (see CMakeLists.txt).
 #
 #   make            build the demo and the tests into build/
-#   make test       run the unit tests
-#   make asan       run the unit tests built with -fsanitize=address,undefined
+#   make test       run the unit tests and the shared test vectors (tests/vectors/link)
+#   make asan       run both built with -fsanitize=address,undefined
+#   make build/interop_peer   the program the cross-language interop matrix of rewrite-bridge runs (tests/interop/)
 #   make cxx        compile the implementation as C++11 and use the API from C++
 #   make interop    run tests/interop.sh (set RBL_FAKE_HOST, RBL_FAKE_GUEST, RBL_JAVA_CP for the other peers)
 #   make clean
@@ -17,7 +18,7 @@ LDLIBS  := -lm
 THREADS := -pthread
 SAN     := -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
 
-all: $(BUILD)/demo $(BUILD)/test_link $(BUILD)/host_example $(BUILD)/guest_example
+all: $(BUILD)/demo $(BUILD)/test_link $(BUILD)/test_vectors $(BUILD)/interop_peer $(BUILD)/host_example $(BUILD)/guest_example
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -37,14 +38,25 @@ $(BUILD)/test_link: tests/test_link.c rewrite_link.h | $(BUILD)
 $(BUILD)/test_link_asan: tests/test_link.c rewrite_link.h | $(BUILD)
 	$(CC) $(CSTD) $(WARN) -O1 -g $(SAN) $(THREADS) tests/test_link.c -o $@ $(LDLIBS)
 
+$(BUILD)/interop_peer: tests/interop_peer.c rewrite_link.h | $(BUILD)
+	$(CC) $(CSTD) $(WARN) $(OPT) tests/interop_peer.c -o $@ $(LDLIBS)
+
+$(BUILD)/test_vectors: tests/test_vectors.c rewrite_link.h | $(BUILD)
+	$(CC) $(CSTD) $(WARN) $(OPT) $(THREADS) tests/test_vectors.c -o $@ $(LDLIBS)
+
+$(BUILD)/test_vectors_asan: tests/test_vectors.c rewrite_link.h | $(BUILD)
+	$(CC) $(CSTD) $(WARN) -O1 -g $(SAN) $(THREADS) tests/test_vectors.c -o $@ $(LDLIBS)
+
 $(BUILD)/cxx_check: tests/cxx_check.cpp tests/cxx_other.cpp rewrite_link.h | $(BUILD)
 	$(CXX) -std=c++11 $(WARN) $(OPT) tests/cxx_check.cpp tests/cxx_other.cpp -o $@
 
-test: $(BUILD)/test_link
+test: $(BUILD)/test_link $(BUILD)/test_vectors
 	$(BUILD)/test_link
+	$(BUILD)/test_vectors
 
-asan: $(BUILD)/test_link_asan
+asan: $(BUILD)/test_link_asan $(BUILD)/test_vectors_asan
 	$(BUILD)/test_link_asan
+	$(BUILD)/test_vectors_asan
 
 cxx: $(BUILD)/cxx_check
 	$(BUILD)/cxx_check
