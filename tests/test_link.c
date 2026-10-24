@@ -1539,8 +1539,11 @@ static void contention(int seqlock) {
     while (rbli_mono_ms() < end) {
         uint64_t f = rbli_ld_acquire(&c.announce);
         uint32_t slot;
-        if (f == 0) continue;
+        if (f < 2) continue;
         attempts++;
+        /* every other read asks for the frame before the newest one: with two slots that is the
+           slot the writer is filling next, so reader and writer collide on any scheduler */
+        if (attempts & 1) f--;
         slot = (uint32_t)(f % CSLOTS);
         if (seqlock) {
             rbl_pixel_frame fi;
