@@ -55,6 +55,25 @@
  *
  * See the README for a host and a guest example, and for how to embed this in a game plugin.
  */
+/* The implementation needs POSIX (clock_gettime, nanosleep, lstat, ftruncate, ...), which glibc hides
+ * under a strict -std=c99. The feature macros must be defined before the first system header of the
+ * translation unit, so they come first here: include this file before any other header in the file
+ * that holds REWRITE_LINK_IMPLEMENTATION (or define these yourself on the command line). */
+#if defined(REWRITE_LINK_IMPLEMENTATION) && !defined(_WIN32)
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#ifndef _FILE_OFFSET_BITS
+#define _FILE_OFFSET_BITS 64
+#endif
+#if defined(__linux__) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE
+#endif
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE
+#endif
+#endif
+
 #ifndef REWRITE_LINK_H
 #define REWRITE_LINK_H
 
@@ -551,20 +570,6 @@ RBLDEF int rbl_path_is_absolute(const char* path, int windows_rules);
 #ifdef REWRITE_LINK_IMPLEMENTATION
 #ifndef REWRITE_LINK_IMPLEMENTATION_DONE
 #define REWRITE_LINK_IMPLEMENTATION_DONE
-
-#if !defined(_WIN32)
-#ifndef _POSIX_C_SOURCE
-#define _POSIX_C_SOURCE 200809L
-#endif
-#ifndef _FILE_OFFSET_BITS
-#define _FILE_OFFSET_BITS 64
-#endif
-#ifdef __APPLE__
-#ifndef _DARWIN_C_SOURCE
-#define _DARWIN_C_SOURCE
-#endif
-#endif
-#endif
 
 #include <math.h>
 #include <stdio.h>
@@ -1940,6 +1945,7 @@ struct rbl_link {
 
     uint32_t seq, next_query;
     rbl_role focus;
+    uint32_t collision_burst; /* collision datagrams per poll: 32, fewer if the OS granted a small receive buffer */
 
     /* collision snapshot being sent: a copy of the caller's triangles, chunked as it goes out */
     rbl_triangle* cq_tris;
@@ -2756,7 +2762,7 @@ static void rbli_poll_udp(rbl_link* l, uint64_t now) {
 /* Sends up to 32 queued collision chunks. */
 static void rbli_pump_collision(rbl_link* l) {
     int i;
-    for (i = 0; i < RBL_COLLISION_PER_POLL && l->cq_next < l->cq_chunks; i++) {
+    for (i = 0; i < (int)l->collision_burst && l->cq_next < l->cq_chunks; i++) {
         rbl_header h;
         rbl_collision c;
         size_t from = (size_t)l->cq_next * RBL_MAX_TRIANGLES, to = from + RBL_MAX_TRIANGLES, n;
@@ -2785,7 +2791,7 @@ static void rbli_poll_timers(rbl_link* l, uint64_t now) {
         uint64_t silent = now - l->last_heard;
         if (silent > l->timeout_ms) {
             char t[64];
-            snprintf(t, sizeof t, "watchdog: nothing heard for %lu ms", (unsigned long)silent);
+            snprintf(t, sizeof t, "watchdog: nothing heard for %llu ms", (unsigned long long)silent);
             rbli_end(l, t, 1);
             return;
         }
@@ -2859,6 +2865,20 @@ static int rbli_link_create(const rbl_config* cfg, rbl_role role, rbl_link** out
     l->heartbeat_ms = l->cfg.heartbeat_ms < RBL_MIN_HEARTBEAT_MS ? RBL_MIN_HEARTBEAT_MS
                       : l->cfg.heartbeat_ms > RBL_MAX_HEARTBEAT_MS ? RBL_MAX_HEARTBEAT_MS : l->cfg.heartbeat_ms;
     l->udp = rbli_udp_open(cfg->udp_port, &l->udp_port);
+    l->collision_burst = RBL_COLLISION_PER_POLL;
+    if (l->udp != RBLI_BAD_SOCK) {
+        /* The peer is on this machine and asked for the same buffer, so what this socket was granted is
+         * what its buffer will be. Linux caps the request at net.core.rmem_max and reports twice what it
+         * keeps; a 8 KiB datagram costs about 12 KB of that. The contract says "at most 32", so fewer is
+         * allowed: never burst more than the buffer holds. */
+        int got = 0;
+        socklen_t gl = (socklen_t)sizeof got;
+        if (getsockopt(l->udp, SOL_SOCKET, SO_RCVBUF, (char*)&got, &gl) == 0 && got > 0) {
+            uint32_t fit = (uint32_t)got / 12000u;
+            if (fit < 8) fit = 8;
+            if (fit < l->collision_burst) l->collision_burst = fit;
+        }
+    }
     if (l->udp != RBLI_BAD_SOCK && role == RBL_ROLE_HOST) {
         l->listener = rbli_tcp_listen(cfg->control_port, &l->control_port);
     } else {

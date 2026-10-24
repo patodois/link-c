@@ -4,6 +4,19 @@
  *   make test            normal build
  *   make asan            the same under -fsanitize=address,undefined
  */
+/* strict C99 hides POSIX (clock_gettime, nanosleep, mkfifo, ...): ask for it before the first system header */
+#if !defined(_WIN32)
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#if defined(__linux__) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE
+#endif
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE
+#endif
+#endif
+
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -747,9 +760,14 @@ static rbl_stats stats_of(rbl_link* l) { rbl_stats s; rbl_link_stats(l, &s); ret
 
 typedef struct Raw { rbli_sock tcp, udp; uint16_t udp_port; char buf[70000]; size_t len; int eof, reset; } Raw;
 
+/* The raw peer holds its own Winsock reference (WSAStartup is counted): without it, the WSACleanup of
+ * the last rbl_link_close() shuts Winsock down under the raw sockets, which then fail with
+ * WSANOTINITIALISED, and a test that reads the host's last bytes after rbl_link_close() sees none. */
 static int raw_open(Raw* r, uint16_t host_port) {
     uint64_t end = rbli_mono_ms() + 2000;
     memset(r, 0, sizeof *r);
+    r->tcp = r->udp = RBLI_BAD_SOCK;
+    if (rbli_net_up() != 0) return 0;
     r->udp = rbli_udp_open(0, &r->udp_port);
     if (r->udp == RBLI_BAD_SOCK) return 0;
     r->tcp = rbli_tcp_connect_start(host_port);
@@ -790,6 +808,7 @@ static int raw_line(Raw* r, char* out, size_t cap) {
 static void raw_close(Raw* r) {
     if (r->tcp != RBLI_BAD_SOCK) rbli_sock_close(r->tcp);
     if (r->udp != RBLI_BAD_SOCK) rbli_sock_close(r->udp);
+    rbli_net_down();
 }
 /* pumps `host` (collecting into c) until the raw peer has a line, or ms pass */
 static int raw_wait_line(Raw* r, rbl_link* host, Col* c, int ms, char* out, size_t cap) {
@@ -802,9 +821,9 @@ static int raw_wait_eof(Raw* r, rbl_link* host, Col* c, int ms) {
     WAIT_UNTIL(ms, (col_poll(host, c), raw_pump(r)), r->eof, ok);
     return ok;
 }
-static void hello_line(char* out, size_t cap, const char* role, int protocol, int min_protocol, unsigned udp_port, long hb) {
+static void hello_line(char* out, size_t cap, const char* role, int protocol, int min_protocol, unsigned udp_port, long long hb) {
     snprintf(out, cap, "{\"type\":\"hello\",\"role\":\"%s\",\"game\":\"raw\",\"protocol\":%d,\"min_protocol\":%d,\"udp_port\":%u,"
-                       "\"heartbeat_ms\":%ld,\"timeout_ms\":2000}\n", role, protocol, min_protocol, udp_port, hb);
+                       "\"heartbeat_ms\":%lld,\"timeout_ms\":2000}\n", role, protocol, min_protocol, udp_port, hb);
 }
 
 TEST(handshake_state_flow_and_clean_bye) {
@@ -1759,7 +1778,7 @@ TEST(review_our_own_heartbeat_is_within_what_a_hello_may_announce) {
 }
 
 /* Says hello as a raw guest with the given heartbeat; returns the host's HandshakeFailed reason, or NULL if it connected. */
-static const char* hello_with_heartbeat(long ms, Col* c) {
+static const char* hello_with_heartbeat(long long ms, Col* c) {
     rbl_config h;
     rbl_link* host;
     Raw r;
@@ -1779,17 +1798,18 @@ static const char* hello_with_heartbeat(long ms, Col* c) {
 }
 
 TEST(review_heartbeat_ms_outside_10_to_10000_is_a_handshake_error) {
-    static const long bad[] = {0, 1, 9, 10001, 3600000L, 4294967295L};
-    static const long good[] = {10, 250, 10000};
+    /* long long: 4294967295L is -1 where long has 32 bits (LLP64, Windows) */
+    static const long long bad[] = {0, 1, 9, 10001, 3600000LL, 4294967295LL};
+    static const long long good[] = {10, 250, 10000};
     size_t i;
     Col c;
     for (i = 0; i < sizeof bad / sizeof bad[0]; i++) {
         const char* reason = hello_with_heartbeat(bad[i], &c);
-        if (!reason || !strstr(reason, "heartbeat_ms")) { char m[200]; snprintf(m, sizeof m, "heartbeat_ms %ld: %s", bad[i], reason ? reason : "connected"); t_fail(__FILE__, __LINE__, m); }
+        if (!reason || !strstr(reason, "heartbeat_ms")) { char m[200]; snprintf(m, sizeof m, "heartbeat_ms %lld: %s", bad[i], reason ? reason : "connected"); t_fail(__FILE__, __LINE__, m); }
     }
     for (i = 0; i < sizeof good / sizeof good[0]; i++) {
         const char* reason = hello_with_heartbeat(good[i], &c);
-        if (reason) { char m[200]; snprintf(m, sizeof m, "heartbeat_ms %ld is fine but: %s", good[i], reason); t_fail(__FILE__, __LINE__, m); }
+        if (reason) { char m[200]; snprintf(m, sizeof m, "heartbeat_ms %lld is fine but: %s", good[i], reason); t_fail(__FILE__, __LINE__, m); }
     }
 }
 

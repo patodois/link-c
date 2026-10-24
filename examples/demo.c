@@ -9,6 +9,16 @@
  * a snapshot of N full chunks each second instead of the small ground patch. guest --orbit circles the
  * camera at 8 m instead of floating 3 m ahead of it.
  */
+/* strict C99 hides POSIX (nanosleep): ask for it before the first system header */
+#if !defined(_WIN32)
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+#if defined(__linux__) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE
+#endif
+#endif
+
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
