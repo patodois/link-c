@@ -1,4 +1,4 @@
-/* rewrite_link.h - the rewrite-bridge passthrough link protocol v1 (revision 4), C99, single header.
+/* rewrite_link.h - the rewrite-bridge passthrough link protocol v1 (revision 5), C99, single header.
  *
  * https://github.com/patodois/link-c  -  MIT OR Apache-2.0
  *
@@ -50,8 +50,13 @@
  * LIMITS YOU CAN TRIP
  *   - Strings in control messages are UTF-8 and at most 65536 bytes per line. A string with an
  *     invalid UTF-8 sequence that you pass in is sent with U+FFFD in its place.
- *   - A string that arrives with an embedded NUL ("\u0000") is cut at the NUL in the C string;
- *     a frame_channel path with one is delivered as NULL (and refused by the reader).
+ *   - A control line with a "\u0000" escape in any string (a value, a key, a field this library
+ *     does not know, one that a later duplicate key overrides) is a protocol error (contract
+ *     section 8), so no string that reaches you holds a NUL. The strings you pass in end at their
+ *     first NUL, as C strings do, so a sender cannot put one on the wire either.
+ *   - A collision snapshot has at most RBL_MAX_COLLISION_CHUNKS (4096) chunks, 925696 triangles:
+ *     rbl_link_send_collision() refuses more with RBL_ERR_TOO_BIG, and a datagram that claims more
+ *     chunks is malformed.
  *
  * See the README for a host and a guest example, and for how to embed this in a game plugin.
  */
@@ -90,7 +95,7 @@ extern "C" {
 #define RBLDEF extern
 #endif
 
-#define REWRITE_LINK_VERSION "0.1.1"
+#define REWRITE_LINK_VERSION "0.1.2"
 
 /* ------------------------------------------------------------------------------------------
  * Constants and layouts (CONTRACT.md section 10)
@@ -103,6 +108,8 @@ extern "C" {
 #define RBL_MAX_DATAGRAM   8192
 #define RBL_MAX_POSES      102
 #define RBL_MAX_TRIANGLES  226
+#define RBL_MAX_COLLISION_CHUNKS 4096 /* most chunks of one collision snapshot: 4096 * 226 = 925696 triangles (contract 9.5) */
+#define RBL_MAX_COLLISION_TRIANGLES (RBL_MAX_COLLISION_CHUNKS * RBL_MAX_TRIANGLES) /* 925696 */
 #define RBL_HEADER_LEN     24
 #define RBL_CAMERA_LEN     152
 #define RBL_POSE_LEN       80
@@ -283,7 +290,8 @@ RBLDEF void rbl_quat_rotate(float out[3], const float q[4], const float v[3]);
 
 /* The encoders write a whole datagram into out and return its length, or a negative rbl_status
  * (RBL_ERR_TOO_BIG if cap is too small, RBL_ERR_MALFORMED for a value the contract forbids: a
- * pose count outside 1..102, more than 226 triangles, chunk_index >= chunk_count, a depth_range
+ * pose count outside 1..102, more than 226 triangles, chunk_index >= chunk_count, chunk_count
+ * above RBL_MAX_COLLISION_CHUNKS, a depth_range
  * above 2, frame number 0). h->magic and h->kind are ignored; they are always written right. */
 RBLDEF int rbl_wire_encode_heartbeat(const rbl_header* h, uint8_t* out, size_t cap);
 RBLDEF int rbl_wire_encode_camera(const rbl_header* h, const rbl_camera* c, uint8_t* out, size_t cap);
@@ -292,7 +300,8 @@ RBLDEF int rbl_wire_encode_poses(const rbl_header* h, const rbl_pose* poses, siz
 RBLDEF int rbl_wire_encode_collision(const rbl_header* h, const rbl_collision* c, const rbl_triangle* tris,
                                      size_t count, uint8_t* out, size_t cap);
 RBLDEF int rbl_wire_encode_frame(const rbl_header* h, const rbl_frame* f, uint8_t* out, size_t cap);
-/* Number of datagrams a snapshot of n triangles needs (at least 1). */
+/* Number of datagrams a snapshot of n triangles needs (at least 1). It can exceed RBL_MAX_COLLISION_CHUNKS,
+ * and then the snapshot cannot be sent. */
 RBLDEF size_t rbl_wire_chunk_count(size_t n_triangles);
 
 typedef struct rbl_decoded {
@@ -324,7 +333,7 @@ typedef enum rbl_control_type {
     RBL_CTL_FRAME_CHANNEL, RBL_CTL_BYE
 } rbl_control_type;
 
-/* A string inside a parsed line: ptr[0..len), also NUL terminated, may contain NULs. */
+/* A string inside a parsed line: ptr[0..len), also NUL terminated. It holds no NUL: a "\u0000" escape is a parse error. */
 typedef struct rbl_str { const char* ptr; size_t len; } rbl_str;
 
 typedef struct rbl_control {
@@ -364,11 +373,12 @@ typedef struct rbl_config {
     uint32_t heartbeat_ms;       /* heartbeat period; clamped to 10..10000 */
     uint32_t timeout_ms;         /* own watchdog timeout; the effective one is max(this, 4 * peer heartbeat) */
     uint32_t reconnect_ms;       /* guest: how often to retry connecting while no host answers */
-    uint32_t max_collision_triangles; /* receiver limit on one assembled snapshot (a snapshot above it is dropped) */
+    uint32_t max_collision_triangles; /* receiver limit on one assembled snapshot (a snapshot above it is dropped); default and
+                                         maximum RBL_MAX_COLLISION_TRIANGLES (925696), 0 = the default, a larger value is clamped */
 } rbl_config;
 
 /* Fills in the defaults: control port 47800, UDP port 0, heartbeat 250 ms, timeout 2000 ms,
- * reconnect 500 ms, 2097152 triangles. */
+ * reconnect 500 ms, 925696 triangles (4096 chunks, the contract's limit; you may lower it). */
 RBLDEF void rbl_config_init(rbl_config* cfg, const char* game);
 
 typedef struct rbl_peer_info {
@@ -413,7 +423,7 @@ typedef struct rbl_event {
         struct { uint32_t entity; } despawn;
         /* host: the guest REQUESTS the focus (requested = 1); guest: the host SET it (requested = 0) */
         struct { rbl_role focus; int requested; } focus;
-        struct { const char* path; /* NULL if it held a NUL */ uint32_t width, height, slots; } frame_channel;
+        struct { const char* path; uint32_t width, height, slots; } frame_channel;
     } u;
 } rbl_event;
 
@@ -504,7 +514,7 @@ typedef struct rbl_pixel_frame {
 /* Diagnostics: why reads returned a miss. */
 typedef struct rbl_pixel_stats { uint64_t busy, other_frame, overwritten, gone; } rbl_pixel_stats;
 
-/* Maps a pixel file read-only after the checks of revision 4: the path must be absolute and name a
+/* Maps a pixel file read-only after the checks of revision 5: the path must be absolute and name a
  * regular file (a symlink, FIFO, device, directory or socket is refused; on Unix the file is
  * checked before and after it is opened, with O_NONBLOCK, and both must be the same device and
  * inode), width and height 1..16384, at most 2^26 pixels, stride == width * 4, slots 1..16, every
@@ -517,10 +527,20 @@ RBLDEF int rbl_pixel_reader_has_depth(const rbl_pixel_reader* r);
 /* 1 when the file is now shorter than the mapping (the peer truncated it) or cannot be examined.
  * rbl_pixel_reader_read() checks it before every read. */
 RBLDEF int rbl_pixel_reader_is_gone(const rbl_pixel_reader* r);
-/* Copies frame `frame` out of `slot` with the seqlock. rgba must hold slot width * height * 4
- * bytes (the file's width * height * 4 is always enough); depth may be NULL (not wanted) or hold
- * width * height floats. info (may be NULL) gets the slot's header. Returns RBL_OK, an
- * RBL_MISS_* (skip the frame), RBL_ERR_TOO_BIG if a buffer is too small, or RBL_ERR_ARGS. */
+/* Reads the frame that a Frame datagram announced (what RBL_EV_FRAME carries: f->frame, f->slot,
+ * f->width, f->height), the way contract section 9.6 says. The frame is skipped (RBL_MISS_OTHER_FRAME,
+ * before any pixel is copied) when f->slot is not below the file's slots, when the datagram's width or
+ * height is 0 or above the file's, or when the slot header's width or height is 0, above the file's or
+ * not equal to the datagram's. It does not require slot == frame % slots. Then it copies frame
+ * f->frame out of the slot with the seqlock. rgba must hold the slot's width * height * 4 bytes (the
+ * file's width * height * 4 is always enough); depth may be NULL (not wanted) or hold width * height
+ * floats. info (may be NULL) gets the slot's header. Returns RBL_OK, an RBL_MISS_* (skip the frame),
+ * RBL_ERR_TOO_BIG if a buffer is too small, or RBL_ERR_ARGS. */
+RBLDEF int rbl_pixel_reader_read_frame(rbl_pixel_reader* r, const rbl_frame* f, uint8_t* rgba, size_t rgba_cap,
+                                       float* depth, size_t depth_cap, rbl_pixel_frame* info);
+/* The same without the datagram's size: for a caller that has only the frame number and the slot. The
+ * slot header's width and height are checked against the file's (0 or above it is a skip) but not
+ * against the datagram's, which this call does not see, so prefer rbl_pixel_reader_read_frame(). */
 RBLDEF int rbl_pixel_reader_read(rbl_pixel_reader* r, uint64_t frame, uint32_t slot, uint8_t* rgba,
                                  size_t rgba_cap, float* depth, size_t depth_cap, rbl_pixel_frame* info);
 RBLDEF void rbl_pixel_reader_stats(const rbl_pixel_reader* r, rbl_pixel_stats* out);
@@ -1159,7 +1179,7 @@ RBLDEF int rbl_wire_encode_collision(const rbl_header* h, const rbl_collision* c
     size_t i, total;
     if (!h || !c || !out || (count > 0 && !tris)) return RBL_ERR_ARGS;
     if (count > RBL_MAX_TRIANGLES) return RBL_ERR_MALFORMED;
-    if (c->chunk_count < 1 || c->chunk_index >= c->chunk_count) return RBL_ERR_MALFORMED;
+    if (c->chunk_count < 1 || c->chunk_index >= c->chunk_count || c->chunk_count > RBL_MAX_COLLISION_CHUNKS) return RBL_ERR_MALFORMED;
     total = RBL_HEADER_LEN + 32 + RBL_TRIANGLE_LEN * count;
     if (cap < total) return RBL_ERR_TOO_BIG;
     rbli_put_header(out, h, RBL_COLLISION);
@@ -1250,7 +1270,7 @@ RBLDEF int rbl_wire_decode(const uint8_t* buf, size_t len, rbl_decoded* d) {
         index = rbli_get16(p + 4);
         count = rbli_get16(p + 6);
         n = rbli_get32(p + 24);
-        if (count == 0 || index >= count) return RBL_ERR_MALFORMED;
+        if (count == 0 || index >= count || count > RBL_MAX_COLLISION_CHUNKS) return RBL_ERR_MALFORMED;
         if (n > RBL_MAX_TRIANGLES) return RBL_ERR_MALFORMED;
         if (payload != 32 + (size_t)RBL_TRIANGLE_LEN * n) return RBL_ERR_MALFORMED;
         c->query = rbli_get32(p);
@@ -1508,6 +1528,9 @@ static int rbli_jstring(rbli_jp* p, char** out, size_t* outlen) {
         case 'u': {
             uint32_t u, low;
             if (rbli_jhex4(p, &u) != 0) return -1;
+            /* U+0000 in any string is an error (contract section 8): a C string cannot hold it, and a line must mean the same
+             * to every implementation, also where a later duplicate key hides the value or the field is not one we know */
+            if (u == 0) return rbli_jfail(p, "U+0000 in a string");
             if (u >= 0xD800 && u <= 0xDBFF) {
                 if (p->i + 1 >= p->n || p->s[p->i] != '\\' || p->s[p->i + 1] != 'u') return rbli_jfail(p, "lone leading surrogate in hex escape");
                 p->i += 2;
@@ -2814,7 +2837,7 @@ RBLDEF void rbl_config_init(rbl_config* cfg, const char* game) {
     cfg->heartbeat_ms = 250;
     cfg->timeout_ms = 2000;
     cfg->reconnect_ms = 500;
-    cfg->max_collision_triangles = 2097152;
+    cfg->max_collision_triangles = RBL_MAX_COLLISION_TRIANGLES;
 }
 
 RBLDEF int rbl_os_error(void) { return rbli_os_errno(); }
@@ -2861,7 +2884,9 @@ static int rbli_link_create(const rbl_config* cfg, rbl_role role, rbl_link** out
     if (l->cfg.heartbeat_ms == 0) l->cfg.heartbeat_ms = 250;
     if (l->cfg.timeout_ms == 0) l->cfg.timeout_ms = 2000;
     if (l->cfg.reconnect_ms == 0) l->cfg.reconnect_ms = 500;
-    if (l->cfg.max_collision_triangles == 0) l->cfg.max_collision_triangles = 2097152;
+    /* a receiver may lower the limit; it cannot raise it above the contract's, which the decoder enforces through chunk_count */
+    if (l->cfg.max_collision_triangles == 0 || l->cfg.max_collision_triangles > RBL_MAX_COLLISION_TRIANGLES)
+        l->cfg.max_collision_triangles = RBL_MAX_COLLISION_TRIANGLES;
     l->heartbeat_ms = l->cfg.heartbeat_ms < RBL_MIN_HEARTBEAT_MS ? RBL_MIN_HEARTBEAT_MS
                       : l->cfg.heartbeat_ms > RBL_MAX_HEARTBEAT_MS ? RBL_MAX_HEARTBEAT_MS : l->cfg.heartbeat_ms;
     l->udp = rbli_udp_open(cfg->udp_port, &l->udp_port);
@@ -2971,8 +2996,9 @@ RBLDEF int rbl_link_send_collision(rbl_link* l, const float center[3], float rad
     size_t chunks;
     if (!l || !center || (count && !tris)) return RBL_ERR_ARGS;
     if (l->state != RBLI_LIVE) return RBL_ERR_NOT_CONNECTED;
+    /* a snapshot has at most 4096 chunks (contract 9.5): refuse before anything is copied or allocated */
+    if (count > (size_t)RBL_MAX_COLLISION_TRIANGLES) return RBL_ERR_TOO_BIG;
     chunks = rbl_wire_chunk_count(count);
-    if (chunks > 0xFFFF || count > ((size_t)-1) / sizeof(rbl_triangle)) return RBL_ERR_TOO_BIG;
     if (count) {
         copy = (rbl_triangle*)REWRITE_LINK_MALLOC(sizeof(rbl_triangle) * count);
         if (!copy) return RBL_ERR_NOMEM;
@@ -3175,7 +3201,7 @@ RBLDEF int rbl_path_is_absolute(const char* path, int windows_rules) {
 
 static int rbli_path_abs_here(const char* path) { return rbl_path_is_absolute(path, RBLI_WINDOWS); }
 
-/* Checks a pixel file header (revision 4) against the file's length. size is the file length
+/* Checks a pixel file header (revision 5) against the file's length. size is the file length
  * in bytes. Returns RBL_OK or RBL_ERR_REFUSED. Pure: it reads only hdr[0..64). */
 static int rbli_pf_validate(const uint8_t* hdr, uint64_t size, rbl_pixel_info* info) {
     uint32_t slots, w, h, stride, format, depth_format, depth_stride;
@@ -3360,8 +3386,9 @@ RBLDEF int rbl_pixel_reader_is_gone(const rbl_pixel_reader* r) {
 #endif
 }
 
-RBLDEF int rbl_pixel_reader_read(rbl_pixel_reader* r, uint64_t frame, uint32_t slot, uint8_t* rgba, size_t rgba_cap,
-                                 float* depth, size_t depth_cap, rbl_pixel_frame* info) {
+/* dw, dh: the Frame datagram's size, or both 0 with `have_size` 0 when the caller has none */
+static int rbli_pixel_read(rbl_pixel_reader* r, uint64_t frame, uint32_t slot, int have_size, uint32_t dw, uint32_t dh,
+                           uint8_t* rgba, size_t rgba_cap, float* depth, size_t depth_cap, rbl_pixel_frame* info) {
     const uint8_t* p;
     uint64_t l1, l2, f, time_us;
     uint32_t cam, w, h, y;
@@ -3369,6 +3396,7 @@ RBLDEF int rbl_pixel_reader_read(rbl_pixel_reader* r, uint64_t frame, uint32_t s
     int want_depth;
     if (!r || !rgba) return RBL_ERR_ARGS;
     if (slot >= r->info.slots) return RBL_MISS_OTHER_FRAME;
+    if (have_size && (dw < 1 || dh < 1 || dw > r->info.width || dh > r->info.height)) { r->st.other_frame++; return RBL_MISS_OTHER_FRAME; }
     if (rbl_pixel_reader_is_gone(r)) { r->st.gone++; return RBL_MISS_GONE; } /* the next access to a shrunk file would fault */
     p = r->map + RBLI_FILE_HDR + (size_t)slot * (size_t)r->info.slot_size; /* checked at open: inside the file */
     l1 = rbli_ld_acquire(p); /* step 1 */
@@ -3378,7 +3406,11 @@ RBLDEF int rbl_pixel_reader_read(rbl_pixel_reader* r, uint64_t frame, uint32_t s
     cam = rbli_get32(p + 24);
     w = rbli_get32(p + 28);
     h = rbli_get32(p + 32);
-    if (f != frame || w < 1 || h < 1 || w > r->info.width || h > r->info.height) { r->st.other_frame++; return RBL_MISS_OTHER_FRAME; }
+    /* the slot header's size must be 1..the file's and, when we have the datagram's, equal to it: else skip, before copying */
+    if (f != frame || w < 1 || h < 1 || w > r->info.width || h > r->info.height || (have_size && (w != dw || h != dh))) {
+        r->st.other_frame++;
+        return RBL_MISS_OTHER_FRAME;
+    }
     want_depth = depth != NULL && r->info.depth_format == RBL_DEPTH_LINEAR_F32;
     need_c = (size_t)w * h * 4u;
     need_d = (size_t)w * h;
@@ -3402,6 +3434,17 @@ RBLDEF int rbl_pixel_reader_read(rbl_pixel_reader* r, uint64_t frame, uint32_t s
         info->has_depth = want_depth;
     }
     return RBL_OK;
+}
+
+RBLDEF int rbl_pixel_reader_read_frame(rbl_pixel_reader* r, const rbl_frame* f, uint8_t* rgba, size_t rgba_cap,
+                                       float* depth, size_t depth_cap, rbl_pixel_frame* info) {
+    if (!f) return RBL_ERR_ARGS;
+    return rbli_pixel_read(r, f->frame, f->slot, 1, f->width, f->height, rgba, rgba_cap, depth, depth_cap, info);
+}
+
+RBLDEF int rbl_pixel_reader_read(rbl_pixel_reader* r, uint64_t frame, uint32_t slot, uint8_t* rgba, size_t rgba_cap,
+                                 float* depth, size_t depth_cap, rbl_pixel_frame* info) {
+    return rbli_pixel_read(r, frame, slot, 0, 0, 0, rgba, rgba_cap, depth, depth_cap, info);
 }
 
 RBLDEF void rbl_pixel_reader_close(rbl_pixel_reader* r) {

@@ -140,7 +140,7 @@ static int run_host(rbl_link* link, double seconds) {
             }
             case RBL_EV_FRAME: {
                 rbl_pixel_frame fi;
-                if (reader && rbl_pixel_reader_read(reader, e->u.frame.frame.frame, e->u.frame.frame.slot, px, px_cap, depth, depth_cap, &fi) == RBL_OK) {
+                if (reader && rbl_pixel_reader_read_frame(reader, &e->u.frame.frame, px, px_cap, depth, depth_cap, &fi) == RBL_OK) {
                     frames_read++;
                     describe(last_frame, sizeof last_frame, &fi, px, depth);
                 } else {

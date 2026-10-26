@@ -55,7 +55,7 @@
  *     scripts/sync-link-vectors.sh <path of this repository>
  * (it copies the directory and prints "VECTORS_DIGEST = <hex>"), paste the hex here, then run `make test`
  * and re-check KNOWN_DISAGREEMENTS. */
-#define VECTORS_DIGEST "858a48ffc10cd1ef4d2867844c34e9fa952b826d8034ff9cee88dcc062beba5d"
+#define VECTORS_DIGEST "2cb6121126bd62ac753041c73a3ddb8d5c762c7adf0b749f7fa5672e22e90603"
 
 /* Vectors this implementation fails: { id, why }, the list ends with { NULL, NULL }. */
 static const struct { const char* id; const char* why; } KNOWN_DISAGREEMENTS[] = {
@@ -1192,6 +1192,15 @@ static int check_datagram(const JV* c) {
         else if (d.header.kind != ju32k(c, "kind")) ret = failf("kind is %u, expected %u", d.header.kind, ju32k(c, "kind"));
         else if (d.u.unknown.payload_len != ju32k(c, "payload_len"))
             ret = failf("payload_len is %lu, expected %u", (unsigned long)d.u.unknown.payload_len, ju32k(c, "payload_len"));
+    } else if (strcmp(expect, "accept") == 0) {
+        /* revision 5: a known kind whose values the decoder does not check; only the kind is compared (a NaN has no JSON form) */
+        const char* kind = jstr(c, "kind");
+        unsigned want = strcmp(kind, "heartbeat") == 0 ? RBL_HEARTBEAT : strcmp(kind, "camera") == 0 ? RBL_CAMERA :
+                        strcmp(kind, "pose") == 0 ? RBL_POSE : strcmp(kind, "collision") == 0 ? RBL_COLLISION :
+                        strcmp(kind, "frame") == 0 ? RBL_FRAME : 0u;
+        if (want == 0) { format_error("unknown accept kind", kind); ret = failf("bad vector"); }
+        else if (rc != RBL_OK) ret = failf("rejected (%s): %s", rbl_strerror(rc), jstr_or(c, "why", ""));
+        else if (d.header.kind != want) ret = failf("decoded as kind %u, expected %s", d.header.kind, kind);
     } else if (strcmp(expect, "decode") == 0) {
         const JV* hj = jreq(c, "header");
         const JV* body = jreq(c, "body");
@@ -1355,7 +1364,16 @@ static int check_read(rbl_pixel_reader* rd, const JV* r) {
     rgba = (uint8_t*)xrealloc(NULL, rgba_cap);
     if (want_depth) depth = (float*)xrealloc(NULL, depth_cap * sizeof(float));
     memset(&got, 0, sizeof got);
-    rc = rbl_pixel_reader_read(rd, frame, slot, rgba, rgba_cap, depth, depth_cap, &got);
+    {   /* the Frame datagram: its frame, slot and size (the keys of a read are the datagram's) */
+        rbl_frame dg;
+        memset(&dg, 0, sizeof dg);
+        dg.frame = frame;
+        dg.slot = slot;
+        dg.camera_seq = ju32k(r, "camera_seq");
+        dg.width = ju32k(r, "width");
+        dg.height = ju32k(r, "height");
+        rc = rbl_pixel_reader_read_frame(rd, &dg, rgba, rgba_cap, depth, depth_cap, &got);
+    }
     if (strcmp(expect, "skip") == 0) {
         if (rc == RBL_OK) ret = failf("delivered frame %llu (%s)", (unsigned long long)got.frame, jstr_or(r, "why", ""));
         else if (rc < 0) ret = failf("returned the error %s, expected a skip (%s)", rbl_strerror(rc), jstr_or(r, "why", ""));
@@ -1535,6 +1553,7 @@ static int check_pixel_writer(const JV* c) {
     rbl_pixel_writer* wr = NULL;
     const JV* writes = jreq(w, "writes");
     size_t i;
+    uint64_t done = 0;
     uint8_t *got = NULL, *want = NULL;
     size_t gn = 0, wn = 0;
     if (temp_new(&t) != 0) return failf("cannot create a temporary directory");
@@ -1565,6 +1584,7 @@ static int check_pixel_writer(const JV* c) {
         const char* hs = jstr(wj, "rgba");
         size_t rn = 0;
         uint8_t* rgba = hex_decode(hs, strlen(hs), &rn);
+        const int refused = strcmp(jstr_or(wj, "expect", ""), "refused") == 0;
         const JV* dj = jreq(wj, "depth");
         float* depth = NULL;
         size_t dn = 0, k;
@@ -1575,10 +1595,13 @@ static int check_pixel_writer(const JV* c) {
             depth = (float*)xrealloc(NULL, (dn + 1) * sizeof(float));
             for (k = 0; k < dn; k++) depth[k] = jf32(&dj->v[k]);
         }
+        /* hex_decode of an empty string still returns a non-NULL buffer, so that a refusal is for the size and not for a NULL pointer */
         rc = rbl_pixel_writer_write(wr, rgba, rn, depth, dn, ju32k(wj, "width"), ju32k(wj, "height"), ju32k(wj, "camera_seq"),
                                     ju64k(wj, "time_us"), &frame);
-        if (rc != RBL_OK) ret = failf("write %lu failed: %s", (unsigned long)i, rbl_strerror(rc));
-        else if (frame != (uint64_t)i + 1) ret = failf("write %lu announced frame %llu", (unsigned long)i, (unsigned long long)frame);
+        if (refused) {
+            if (rc == RBL_OK) ret = failf("write %lu was accepted (%s)", (unsigned long)i, jstr_or(wj, "why", ""));
+        } else if (rc != RBL_OK) ret = failf("write %lu failed: %s", (unsigned long)i, rbl_strerror(rc));
+        else if (frame != ++done) ret = failf("write %lu announced frame %llu", (unsigned long)i, (unsigned long long)frame);
         free(rgba);
         free(depth);
     }
@@ -1775,6 +1798,13 @@ static void take_event(Sess* s, const rbl_event* e) {
     case RBL_EV_COLLISION:
         jv_set(&o, "query", jv_num(e->u.collision.query, 1));
         jv_set(&o, "triangles", jv_num(e->u.collision.triangle_count, 1));
+        {
+            JV ctr = jv_new(J_ARR);
+            int k;
+            for (k = 0; k < 3; k++) jv_push(&ctr, jv_num((double)e->u.collision.center[k], 0));
+            jv_set(&o, "center", ctr);
+        }
+        jv_set(&o, "radius", jv_num((double)e->u.collision.radius, 0));
         ev_push(s, "collision", o);
         break;
     case RBL_EV_FRAME: {

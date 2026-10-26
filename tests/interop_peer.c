@@ -391,7 +391,7 @@ static void host_check_frame(unsigned k) {
              f->slot, f->camera_seq, f->width, f->height, k, k % FRAME_SLOTS, G.cam_seq[k], FRAME_W, FRAME_H);
         bad = 1;
     }
-    rc = rbl_pixel_reader_read(G.reader, f->frame, f->slot, rgba, sizeof rgba, depth, FRAME_W * FRAME_H, &info);
+    rc = rbl_pixel_reader_read_frame(G.reader, f, rgba, sizeof rgba, depth, FRAME_W * FRAME_H, &info);
     if (rc != RBL_OK) { fail("reading frame %u from the pixel file: %s", k, rbl_strerror(rc)); G.frames_bad++; return; }
     exp_pixels(k, want_rgba, want_depth);
     if (info.frame != k || info.camera_seq != G.cam_seq[k] || info.width != FRAME_W || info.height != FRAME_H || info.time_us != BASE_US + 16666ull * k) {

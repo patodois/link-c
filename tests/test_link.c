@@ -255,6 +255,40 @@ TEST(collision_chunking_offsets_and_length) {
     CHECK_EQ(rbl_wire_encode_collision(&h, &c, NULL, 0, b, sizeof b), 24 + 32);
 }
 
+TEST(collision_chunk_count_is_limited_to_4096) {
+    uint8_t b[8192];
+    rbl_decoded d;
+    rbl_collision c;
+    rbl_header h = mk_header(1, 0, 0);
+    int len;
+    CHECK_EQ(RBL_MAX_COLLISION_CHUNKS, 4096);
+    CHECK_EQ(RBL_MAX_COLLISION_TRIANGLES, 925696);
+    CHECK_EQ(rbl_wire_chunk_count(925696), 4096);
+    CHECK_EQ(rbl_wire_chunk_count(925697), 4097);
+    memset(&c, 0, sizeof c);
+    c.query = 1; c.chunk_index = 4095; c.chunk_count = 4096;
+    len = rbl_wire_encode_collision(&h, &c, NULL, 0, b, sizeof b);
+    CHECK_EQ(len, 24 + 32);
+    REQUIRE(len > 0);
+    REQUIRE(rbl_wire_decode(b, (size_t)len, &d) == RBL_OK);
+    CHECK_EQ(d.u.collision.chunk_index, 4095); CHECK_EQ(d.u.collision.chunk_count, 4096);
+    /* the encoder refuses a chunk_count above the limit ... */
+    c.chunk_index = 0; c.chunk_count = 4097;
+    CHECK_EQ(rbl_wire_encode_collision(&h, &c, NULL, 0, b, sizeof b), RBL_ERR_MALFORMED);
+    c.chunk_count = 65535;
+    CHECK_EQ(rbl_wire_encode_collision(&h, &c, NULL, 0, b, sizeof b), RBL_ERR_MALFORMED);
+    /* ... and the decoder drops a datagram that claims one (index 0, the last index, any in between) */
+    c.chunk_count = 4096;
+    len = rbl_wire_encode_collision(&h, &c, NULL, 0, b, sizeof b);
+    REQUIRE(len > 0);
+    b[24 + 6] = 0x01; b[24 + 7] = 0x10; /* chunk_count 4097, little-endian */
+    CHECK_EQ(rbl_wire_decode(b, (size_t)len, &d), RBL_ERR_MALFORMED);
+    b[24 + 4] = 0x00; b[24 + 5] = 0x10; /* chunk_index 4096 */
+    CHECK_EQ(rbl_wire_decode(b, (size_t)len, &d), RBL_ERR_MALFORMED);
+    b[24 + 6] = 0xFF; b[24 + 7] = 0xFF; /* chunk_count 65535, chunk_index 4096 */
+    CHECK_EQ(rbl_wire_decode(b, (size_t)len, &d), RBL_ERR_MALFORMED);
+}
+
 TEST(frame_datagram_is_48_bytes) {
     rbl_frame f, g;
     uint8_t b[64];
@@ -419,7 +453,8 @@ static int json_accepts(const char* doc) {
     return ok;
 }
 
-/* The documents and whether serde_json (the Rust side) accepts them: the table of link-java's tests. */
+/* The documents and whether serde_json (the Rust side) accepts them: the table of link-java's tests. The one difference is
+ * a \u0000 escape, which serde_json takes and the contract (revision 5, section 8) forbids in every string. */
 static const struct { const char* doc; int ok; } JSON_CORPUS[] = {
     /* numbers */
     {"0", 1}, {"-0", 1}, {"-1", 1}, {"1.5", 1}, {"1e5", 1}, {"1E+5", 1}, {"1e-5", 1}, {"0e0", 1}, {"-0.0", 1},
@@ -427,7 +462,8 @@ static const struct { const char* doc; int ok; } JSON_CORPUS[] = {
     {"01", 0}, {"-01", 0}, {"00", 0}, {"1.", 0}, {"1.e5", 0}, {"-.5", 0}, {".5", 0}, {"1e", 0}, {"1.0e+", 0}, {"+1", 0},
     {"-", 0}, {"- 1", 0}, {"0x10", 0}, {"1e999", 0}, {"Infinity", 0}, {"NaN", 0},
     /* string escapes */
-    {"\"\\u0041\"", 1}, {"\"\\u00E9\"", 1}, {"\"\\u0000\"", 1}, {"\"\\/\"", 1}, {"\"\\ud800\\udc00\"", 1},
+    {"\"\\u0041\"", 1}, {"\"\\u00E9\"", 1}, {"\"\\u0000\"", 0}, {"\"a\\u0000b\"", 0}, {"\"\\u00000\"", 0}, {"\"\\\\u0000\"", 1}, {"{\"\\u0000\":1}", 0},
+    {"[\"\\u0000\"]", 0}, {"\"\\/\"", 1}, {"\"\\ud800\\udc00\"", 1},
     {"\"\\ud83d\\ude00\"", 1}, {"\"\\uD834\\uDD1E\"", 1},
     {"\"\\u004\"", 0}, {"\"\\u00zz\"", 0}, {"\"\\u+041\"", 0}, {"\"\\u-041\"", 0}, {"\"\\u D800\"", 0}, {"\"\\ud800\"", 0},
     {"\"\\udc00\"", 0}, {"\"\\ud800x\"", 0}, {"\"\\ud800\\u0041\"", 0}, {"\"\\ud800\\ud800\"", 0}, {"\"\\udc00\\ud800\"", 0},
@@ -509,9 +545,9 @@ TEST(control_contract_examples_parse) {
     REQUIRE(parse_line("{\"type\":\"hello\",\"role\":\"guest\",\"game\":\"g\",\"protocol\":1,\"min_protocol\":1,\"udp_port\":5,"
                        "\"heartbeat_ms\":250,\"timeout_ms\":2000,\"session\":null}", &c, &why) == RBL_OK);
     CHECK(!c.u.hello.has_session);
-    /* a type with an embedded NUL is not "hello" */
-    REQUIRE(parse_line("{\"type\":\"hello\\u0000x\"}", &c, &why) == RBL_OK);
-    CHECK_EQ(c.type, RBL_CTL_UNKNOWN);
+    /* an escaped backslash followed by the characters u0000 is not a NUL escape */
+    REQUIRE(parse_line("{\"type\":\"spawn\",\"entity\":1,\"provider\":\"p\\\\u0000\",\"asset\":\"a\"}", &c, &why) == RBL_OK);
+    CHECK(str_is(c.u.spawn.provider, "p\\u0000"));
     /* escapes decode in place */
     REQUIRE(parse_line("{\"type\":\"spawn\",\"entity\":1,\"provider\":\"a\\\"b\",\"asset\":\"\\u00e9\\ud83d\\ude00\\n\"}", &c, &why) == RBL_OK);
     CHECK(str_is(c.u.spawn.provider, "a\"b")); CHECK(str_is(c.u.spawn.asset, "\xC3\xA9\xF0\x9F\x98\x80\n"));
@@ -527,6 +563,12 @@ TEST(control_broken_lines_are_protocol_errors) {
         "{\"type\":\"hello\",\"role\":\"nobody\",\"game\":\"g\",\"protocol\":1,\"min_protocol\":1,\"udp_port\":1,\"heartbeat_ms\":1,\"timeout_ms\":1}",
         "{\"type\":\"spawn\",\"entity\":1,\"provider\":\"p\"}", "{\"type\":\"spawn\",\"entity\":1,\"provider\":\"p\",\"asset\":\"a\",\"name\":5}",
         "{\"type\":\"bye\",\"reason\":5}", "{\"type\":\"frame_channel\",\"path\":\"/x\",\"width\":1,\"height\":1}",
+        /* a \u0000 escape anywhere in a string is an error (section 8): a type, a value, a key, an unknown field, a nested one,
+         * a value that a later duplicate key overrides */
+        "{\"type\":\"hello\\u0000x\"}", "{\"type\":\"spawn\",\"entity\":1,\"provider\":\"p\",\"asset\":\"a\",\"name\":\"\\u0000\"}",
+        "{\"type\":\"bye\",\"reason\":\"a\\u0000b\"}", "{\"type\":\"despawn\",\"entity\":1,\"\\u0000\":2}",
+        "{\"type\":\"despawn\",\"entity\":1,\"x\":\"\\u0000\"}", "{\"type\":\"despawn\",\"entity\":1,\"x\":[{\"y\":[\"\\u0000\"]}]}",
+        "{\"type\":\"despawn\",\"entity\":1,\"x\":\"\\u0000\",\"x\":\"ok\"}", "{\"type\":\"frame_channel\",\"path\":\"/tmp/a\\u0000b\",\"width\":1,\"height\":1,\"slots\":1}",
         "{\"type\":\"despawn\",\"entity\":1} trailing", "{\"type\":\"despawn\",\"entity\":1}{", "", "   ", "{", "}", "\"type\"", "null",
     };
     size_t i;
@@ -916,6 +958,8 @@ TEST(hello_with_wrong_role_protocol_or_garbage_gets_bye) {
         {"{\"type\":\"hello\",\"role\":\"host\",\"game\":\"x\",\"protocol\":1,\"min_protocol\":1,\"udp_port\":5,\"heartbeat_ms\":250,\"timeout_ms\":2000}\n", "role"},
         {"{\"type\":\"hello\",\"role\":\"guest\",\"game\":\"x\",\"protocol\":9,\"min_protocol\":2,\"udp_port\":5,\"heartbeat_ms\":250,\"timeout_ms\":2000}\n", "protocol"},
         {"garbage\n", "protocol error"},
+        {"{\"type\":\"hello\",\"role\":\"guest\",\"game\":\"a\\u0000b\",\"protocol\":1,\"min_protocol\":1,\"udp_port\":5,\"heartbeat_ms\":250,\"timeout_ms\":2000}\n", "protocol error"},
+        {"{\"type\":\"hello\",\"role\":\"guest\",\"game\":\"x\",\"protocol\":1,\"min_protocol\":1,\"udp_port\":5,\"heartbeat_ms\":250,\"timeout_ms\":2000,\"x\":\"\\u0000\",\"x\":1}\n", "protocol error"},
         {"{\"type\":\"spawn\",\"entity\":1,\"provider\":\"p\",\"asset\":\"a\"}\n", "expected hello"},
         {"{\"type\":\"hello\",\"role\":\"guest\",\"game\":\"x\",\"protocol\":1,\"min_protocol\":1,\"udp_port\":0,\"heartbeat_ms\":250,\"timeout_ms\":2000}\n", "udp_port"},
     };
@@ -1090,6 +1134,67 @@ static void header_bytes(uint8_t* h, uint32_t slots, uint32_t w, uint32_t hh, ui
     memcpy(h, "RBFRAME\0", 8);
     rbli_put32(h + 8, 1); rbli_put32(h + 12, slots); rbli_put32(h + 16, w); rbli_put32(h + 20, hh);
     rbli_put32(h + 24, stride); rbli_put32(h + 28, 1); rbli_put64(h + 32, slot_size);
+}
+
+TEST(pixel_reader_checks_the_frame_datagrams_size_against_the_file_and_the_slot) {
+    char path[512];
+    rbl_pixel_writer* w;
+    rbl_pixel_reader* r;
+    uint8_t px[24], got[64];
+    rbl_pixel_frame fi;
+    rbl_pixel_stats st0, st1;
+    rbl_frame dg;
+    uint64_t f;
+    int i;
+    tmp_path(path, sizeof path, "dgsize.frames");
+    REQUIRE(rbl_pixel_writer_create(path, 4, 2, 3, 0, &w) == RBL_OK);
+    for (i = 0; i < 24; i++) px[i] = (uint8_t)(i + 1);
+    REQUIRE(rbl_pixel_writer_write(w, px, 24, NULL, 0, 3, 2, 9, 5, &f) == RBL_OK); /* a 3 x 2 frame in a 4 x 2 file */
+    REQUIRE(rbl_pixel_reader_open(path, &r) == RBL_OK);
+    memset(&dg, 0, sizeof dg);
+    dg.frame = 1; dg.slot = 1; dg.width = 3; dg.height = 2;
+    memset(got, 0xEE, sizeof got);
+    CHECK_EQ(rbl_pixel_reader_read_frame(r, &dg, got, sizeof got, NULL, 0, &fi), RBL_OK);
+    CHECK_EQ(fi.width, 3); CHECK_EQ(fi.height, 2); CHECK(memcmp(got, px, 24) == 0);
+    /* a size that differs from the slot header's, is 0, or is above the file's: skip, before any pixel is copied */
+    {   static const uint32_t sizes[][2] = {{4, 2}, {2, 2}, {3, 1}, {3, 3}, {0, 2}, {3, 0}, {0, 0}, {5, 2}, {3, 3}, {0xFFFFFFFFu, 2}};
+        for (i = 0; i < (int)(sizeof sizes / sizeof sizes[0]); i++) {
+            dg.width = sizes[i][0]; dg.height = sizes[i][1];
+            memset(got, 0xEE, sizeof got);
+            if (rbl_pixel_reader_read_frame(r, &dg, got, sizeof got, NULL, 0, &fi) != RBL_MISS_OTHER_FRAME) {
+                char m[100]; snprintf(m, sizeof m, "%u x %u should be skipped", (unsigned)dg.width, (unsigned)dg.height); t_fail(__FILE__, __LINE__, m);
+            }
+            CHECK_EQ(got[0], 0xEE); CHECK_EQ(got[23], 0xEE); /* nothing was copied */
+        }
+    }
+    rbl_pixel_reader_stats(r, &st0);
+    dg.width = 3; dg.height = 2;
+    CHECK_EQ(rbl_pixel_reader_read_frame(r, &dg, got, sizeof got, NULL, 0, &fi), RBL_OK);
+    CHECK_EQ(rbl_pixel_reader_read_frame(NULL, &dg, got, sizeof got, NULL, 0, &fi), RBL_ERR_ARGS);
+    CHECK_EQ(rbl_pixel_reader_read_frame(r, NULL, got, sizeof got, NULL, 0, &fi), RBL_ERR_ARGS);
+    rbl_pixel_reader_stats(r, &st1);
+    CHECK_EQ(st1.other_frame, st0.other_frame);
+    /* the slot need not be frame % slots (contract 9.6 step 0): copy slot 1 to slot 2 in the file, and frame 1 reads from there too */
+    {   size_t n = 0;
+        uint8_t* raw = slurp(path, &n);
+        FILE* fp;
+        REQUIRE(raw != NULL);
+        REQUIRE(n == 64 + 3 * 128);
+        fp = fopen(path, "r+b");
+        REQUIRE(fp != NULL);
+        fseek(fp, 64 + 2 * 128, SEEK_SET);
+        fwrite(raw + 64 + 128, 1, 128, fp);
+        fclose(fp);
+        free(raw);
+    }
+    dg.slot = 2;
+    memset(got, 0, sizeof got);
+    CHECK_EQ(rbl_pixel_reader_read_frame(r, &dg, got, sizeof got, NULL, 0, &fi), RBL_OK);
+    CHECK(fi.frame == 1); CHECK(memcmp(got, px, 24) == 0);
+    dg.slot = 0; /* never written: frame 0 */
+    CHECK_EQ(rbl_pixel_reader_read_frame(r, &dg, got, sizeof got, NULL, 0, &fi), RBL_MISS_OTHER_FRAME);
+    rbl_pixel_reader_close(r);
+    rbl_pixel_writer_close(w);
 }
 
 TEST(pixel_file_colour_only_round_trip) {
@@ -1671,6 +1776,33 @@ TEST(review_collision_chunks_are_paced_and_a_newer_snapshot_replaces_queued_ones
     pair_close(&p);
 }
 
+TEST(send_collision_refuses_more_than_4096_chunks_before_allocating) {
+    Pair p;
+    uint32_t q = 7;
+    rbl_config cfg;
+    size_t a0, n = (size_t)RBL_MAX_COLLISION_TRIANGLES;
+    rbl_triangle* tris;
+    rbl_triangle one[1];
+    float zero[3] = {0, 0, 0};
+    memset(one, 0, sizeof one);
+    rbl_config_init(&cfg, "C");
+    CHECK_EQ(cfg.max_collision_triangles, 925696); /* the contract's limit is the receiver's default */
+    REQUIRE(pair_open(&p));
+    /* the count is checked first: the buffer is a single triangle and is never read (AddressSanitizer would say) */
+    a0 = g_lib_allocs;
+    CHECK_EQ(rbl_link_send_collision(p.host, zero, 1.0f, one, n + 1, &q), RBL_ERR_TOO_BIG);
+    CHECK_EQ(rbl_link_send_collision(p.host, zero, 1.0f, one, (size_t)-1 / sizeof(rbl_triangle), &q), RBL_ERR_TOO_BIG);
+    CHECK_EQ(g_lib_allocs, a0);
+    CHECK_EQ(q, 7); /* no query number was used */
+    /* exactly 4096 chunks (925696 triangles) is accepted */
+    tris = make_tris(n);
+    REQUIRE(tris != NULL);
+    CHECK_EQ(rbl_link_send_collision(p.host, zero, 1.0f, tris, n, &q), RBL_OK);
+    CHECK_EQ(q, 1);
+    free(tris);
+    pair_close(&p);
+}
+
 TEST(review_empty_collision_snapshot_is_one_chunk) {
     Pair p;
     int ok;
@@ -1842,15 +1974,12 @@ TEST(announce_frames_sends_a_frame_channel_line_and_the_file_reads) {
     pair_close(&p);
 }
 
-TEST(a_frame_channel_path_with_a_nul_is_delivered_as_null) {
-    Pair p;
-    Raw r;
+TEST(a_control_line_with_a_nul_escape_is_a_protocol_error) {
     rbl_config h;
     rbl_link* host;
     Col c;
+    Raw r;
     char line[400];
-    int ok;
-    uint32_t session = 0;
     rbl_control hello;
     const char* why;
     memset(&c, 0, sizeof c);
@@ -1861,15 +1990,12 @@ TEST(a_frame_channel_path_with_a_nul_is_delivered_as_null) {
     raw_send(&r, line);
     REQUIRE(raw_wait_line(&r, host, &c, 2000, line, sizeof line));
     REQUIRE(parse_line(line, &hello, &why) == RBL_OK);
-    session = hello.u.hello.session;
-    CHECK(session != 0);
+    CHECK(hello.u.hello.session != 0);
     raw_send(&r, "{\"type\":\"frame_channel\",\"path\":\"/tmp/a\\u0000/etc/passwd\",\"width\":1,\"height\":1,\"slots\":1}\n");
-    WAIT_UNTIL(2000, col_poll(host, &c), c.frame_channels == 1, ok);
-    REQUIRE(ok);
-    CHECK_STR(c.fc_path, "(null)");
+    CHECK(raw_wait_eof(&r, host, &c, 2000)); /* the session ends (a bye first); no frame_channel event is ever delivered */
+    CHECK_EQ(c.frame_channels, 0);
     raw_close(&r);
     rbl_link_close(host);
-    (void)p;
 }
 
 TEST(poll_with_a_small_array_loses_nothing) {
@@ -1990,6 +2116,7 @@ int main(void) {
     RUN(pose_datagram_offsets_and_length);
     RUN(pose_full_datagram_is_8192_bytes);
     RUN(collision_chunking_offsets_and_length);
+    RUN(collision_chunk_count_is_limited_to_4096);
     RUN(frame_datagram_is_48_bytes);
     RUN(malformed_datagrams_are_rejected);
     RUN(fuzz_datagrams_never_crash);
@@ -2010,6 +2137,7 @@ int main(void) {
     RUN(datagrams_from_another_address_are_dropped);
     RUN(peer_address_must_be_127_0_0_1_and_the_announced_port);
     RUN(pixel_file_colour_only_round_trip);
+    RUN(pixel_reader_checks_the_frame_datagrams_size_against_the_file_and_the_slot);
     RUN(pixel_file_depth_plane);
     RUN(pixel_file_odd_lock_is_skipped);
     RUN(pixel_file_malformed_files_are_refused);
@@ -2025,6 +2153,7 @@ int main(void) {
     RUN(review_a_new_frame_channel_restarts_frame_numbers);
     RUN(review_a_400_chunk_collision_snapshot_completes);
     RUN(review_collision_chunks_are_paced_and_a_newer_snapshot_replaces_queued_ones);
+    RUN(send_collision_refuses_more_than_4096_chunks_before_allocating);
     RUN(review_empty_collision_snapshot_is_one_chunk);
     RUN(review_sending_without_a_peer_is_an_error);
     RUN(review_only_spawned_entities_have_pose_state_at_most_1024);
@@ -2032,7 +2161,7 @@ int main(void) {
     RUN(review_our_own_heartbeat_is_within_what_a_hello_may_announce);
     RUN(review_heartbeat_ms_outside_10_to_10000_is_a_handshake_error);
     RUN(announce_frames_sends_a_frame_channel_line_and_the_file_reads);
-    RUN(a_frame_channel_path_with_a_nul_is_delivered_as_null);
+    RUN(a_control_line_with_a_nul_escape_is_a_protocol_error);
     RUN(poll_with_a_small_array_loses_nothing);
     RUN(a_snapshot_above_the_receivers_limit_is_dropped);
     RUN(fuzz_a_live_host_with_junk_datagrams_and_lines);

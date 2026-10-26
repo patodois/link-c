@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(rewrite_link VERSION 0.1.1 LANGUAGES C CXX)
+project(rewrite_link VERSION 0.1.2 LANGUAGES C CXX)
 
 # rewrite_link.h is a single header. Use it from another CMake project with
 #   add_subdirectory(link-c)   and   target_link_libraries(your_plugin PRIVATE rewrite_link)
