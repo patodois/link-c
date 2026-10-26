@@ -55,7 +55,7 @@
  *     scripts/sync-link-vectors.sh <path of this repository>
  * (it copies the directory and prints "VECTORS_DIGEST = <hex>"), paste the hex here, then run `make test`
  * and re-check KNOWN_DISAGREEMENTS. */
-#define VECTORS_DIGEST "2cb6121126bd62ac753041c73a3ddb8d5c762c7adf0b749f7fa5672e22e90603"
+#define VECTORS_DIGEST "815d4f09e6d15f17dfcfedcf96865c5cfd60e170d3f71fb97f3adc0edc200fd9"
 
 /* Vectors this implementation fails: { id, why }, the list ends with { NULL, NULL }. */
 static const struct { const char* id; const char* why; } KNOWN_DISAGREEMENTS[] = {

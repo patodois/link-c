@@ -540,7 +540,8 @@ RBLDEF int rbl_pixel_reader_read_frame(rbl_pixel_reader* r, const rbl_frame* f, 
                                        float* depth, size_t depth_cap, rbl_pixel_frame* info);
 /* The same without the datagram's size: for a caller that has only the frame number and the slot. The
  * slot header's width and height are checked against the file's (0 or above it is a skip) but not
- * against the datagram's, which this call does not see, so prefer rbl_pixel_reader_read_frame(). */
+ * against the datagram's, which this call does not see. Kept so that existing programs still build;
+ * it is NOT conformant to contract section 9.6 (reader step 2): use rbl_pixel_reader_read_frame(). */
 RBLDEF int rbl_pixel_reader_read(rbl_pixel_reader* r, uint64_t frame, uint32_t slot, uint8_t* rgba,
                                  size_t rgba_cap, float* depth, size_t depth_cap, rbl_pixel_frame* info);
 RBLDEF void rbl_pixel_reader_stats(const rbl_pixel_reader* r, rbl_pixel_stats* out);
@@ -3396,6 +3397,7 @@ static int rbli_pixel_read(rbl_pixel_reader* r, uint64_t frame, uint32_t slot, i
     int want_depth;
     if (!r || !rgba) return RBL_ERR_ARGS;
     if (slot >= r->info.slots) return RBL_MISS_OTHER_FRAME;
+    if (frame == 0) { r->st.other_frame++; return RBL_MISS_OTHER_FRAME; } /* never delivered (contract 9.6, reader step 0) */
     if (have_size && (dw < 1 || dh < 1 || dw > r->info.width || dh > r->info.height)) { r->st.other_frame++; return RBL_MISS_OTHER_FRAME; }
     if (rbl_pixel_reader_is_gone(r)) { r->st.gone++; return RBL_MISS_GONE; } /* the next access to a shrunk file would fault */
     p = r->map + RBLI_FILE_HDR + (size_t)slot * (size_t)r->info.slot_size; /* checked at open: inside the file */

@@ -107,8 +107,8 @@ that gets `RBL_EV_FRAME_CHANNEL` opens the path with `rbl_pixel_reader_open()` a
 calls `rbl_pixel_reader_read_frame()` with the `rbl_frame` of the event. The reader skips the frame (before it
 copies a pixel) when the datagram's width or height is 0 or above the file's, or when the slot header's is 0, above
 the file's or not the datagram's; it does not require `slot == frame % slots`. (`rbl_pixel_reader_read()`, with only
-the frame number and the slot, cannot compare the datagram's size and checks the slot header's against the file's
-alone.) The reader returns
+the frame number and the slot, is kept so that existing programs still build; it cannot compare the datagram's size,
+checks the slot header's against the file's alone and is **not conformant** to contract section 9.6. Frame 0 is always skipped.) The reader returns
 `RBL_MISS_BUSY`, `OTHER_FRAME` or `OVERWRITTEN` when the writer got there first (skip the frame), and
 `RBL_MISS_GONE` when the file shrank under the mapping (drop the reader). Reprojection and compositing with
 depth (CONTRACT 9.7) are the host engine's job; this library does not do them.
