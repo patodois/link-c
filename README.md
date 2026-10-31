@@ -1,7 +1,7 @@
 # link-c
 
 A single-header **C99** implementation of the **rewrite-bridge passthrough link protocol v1** (contract
-revision 5), so that a game mod written in C or C++ (an SKSE or F4SE plugin, a ScriptHookV script, an Unreal
+revision 6), so that a game mod written in C or C++ (an SKSE or F4SE plugin, a ScriptHookV script, an Unreal
 or other native plugin) can be a **host** or a **guest** next to any other game or rewrite that speaks it.
 The protocol is defined by `docs/CONTRACT.md` in the rewrite-bridge repository; this library is one
 implementation of it. The Rust crate, [link-java](https://github.com/patodois/link-java) and this library
@@ -87,6 +87,7 @@ standing in for the game's frame loop. `examples/demo.c` is the longer one, the 
 | `rbl_pixel_writer_create[_temp]`, `rbl_pixel_writer_write`, `rbl_link_announce_writer`, `rbl_pixel_writer_close` | The sending side of the pixel file: created exclusively, colour and optional linear depth, seqlock. |
 | `rbl_pixel_reader_open`, `rbl_pixel_reader_read_frame` (`rbl_pixel_reader_read`), `rbl_pixel_reader_close` | The receiving side: every revision 5 check, copies a slot into your buffers with the seqlock. |
 | `rbl_wire_*`, `rbl_control_parse`, `rbl_control_format` | The codecs, public for tools and tests. |
+| `cfg.token`, `cfg.endpoint_file`, `rbl_generate_token`, `rbl_token_equal`, `rbl_endpoint_write`, `rbl_endpoint_read`, `rbl_endpoint_remove` | Authentication, contract revision 6 (below). |
 | `rbl_camera_look_at`, `rbl_pose_identity`, `rbl_quat_*` | Small helpers in the link's conventions (right-handed, +Y up, +Z front). |
 
 All calls return `RBL_OK` (0) or a negative `rbl_status`; `rbl_strerror()` describes it.
@@ -112,6 +113,47 @@ checks the slot header's against the file's alone and is **not conformant** to c
 `RBL_MISS_BUSY`, `OTHER_FRAME` or `OVERWRITTEN` when the writer got there first (skip the frame), and
 `RBL_MISS_GONE` when the file shrank under the mapping (drop the reader). Reprojection and compositing with
 depth (CONTRACT 9.7) are the host engine's job; this library does not do them.
+
+## Authentication: the token and the endpoint file (contract revision 6)
+
+A host may require a token; a guest then has to send it in its `hello`. Without one, nothing changes. Two new
+optional fields of `rbl_config` (both `NULL` after `rbl_config_init`):
+
+- `token`: host, the token a guest must send; guest, the token it sends. 1 to 256 bytes of valid UTF-8 (anything
+  else makes `rbl_link_host`/`rbl_link_guest` fail with `RBL_ERR_ARGS`). A host checks it before any other check of the
+  handshake, in constant time, and answers a missing, wrong or overlong token with `bye` `"unauthorized"`; your side
+  sees `RBL_EV_HANDSHAKE_FAILED` (the host's reason is exactly `unauthorized`).
+- `endpoint_file`: a path. The **host** writes `{"control_port":N,"token":"..."}` there once its control port is bound
+  (with the port it actually got), atomically and with mode 0600 from the moment the file exists, and removes it when
+  you `rbl_link_close()` it; if no `token` is configured it makes one (32 bytes from the OS generator, 64 hex digits). If
+  writing fails, `rbl_link_host` fails (the listener is closed, and the error never contains the token). The **guest**
+  reads the file before **every** connection attempt, the first and each reconnect, and uses its port and token instead
+  of `control_port` and `token`; if the file cannot be read (not there yet, refused) it makes no attempt and tries again
+  after `reconnect_ms`, without an event.
+
+The library copies `token` and `endpoint_file` while it creates the link, so your strings need not outlive the call to
+`rbl_link_host`/`rbl_link_guest`. It never puts a token in an event, an error, a `bye` or a log line, and wipes its copy
+when the link is closed. A parsed `hello` (`rbl_control_parse`) keeps the whole token the peer sent, of any length, in
+`u.hello.token` with `u.hello.has_token`; compare it only with `rbl_token_equal()`, which says "different" above 256
+bytes, so a 257-byte token that begins with a 256-byte one is not equal to it.
+
+```c
+/* host */  rbl_config_init(&cfg, "My Game"); cfg.control_port = 0; cfg.endpoint_file = "/run/user/1000/rewrite-link/my-game.json";
+/* guest */ rbl_config_init(&cfg, "My Rewrite"); cfg.endpoint_file = "/run/user/1000/rewrite-link/my-game.json";
+```
+
+Helpers, public for tools and tests: `rbl_generate_token(char out[65])`, `rbl_token_equal(a, alen, b, blen)` (the contract's
+constant-time method), `rbl_endpoint_write(path, port, token)`, `rbl_endpoint_read(path, &port, token_out[257])` (a regular
+file, checked before it is opened; on Unix mode `& 077` must be 0; at most 4096 bytes; strict control line JSON) and
+`rbl_endpoint_remove(path)`. The random bytes come from `getrandom` on Linux (`/dev/urandom` if it is missing),
+`arc4random_buf` on macOS and the BSDs and `BCryptGenRandom` on Windows; if the generator fails the call fails, there is
+no weaker fallback.
+
+What this protects: the token keeps out other users of the machine and any process that cannot read the endpoint file,
+and a process that squats the control port before the host (the host's bind fails, so it writes no file). It does **not**
+protect against processes running as the same user, or against an administrator; it authenticates the guest to the host
+only, and encrypts nothing. Contract section 6.2 has the full threat model and the recommended places for the file.
+On Windows the file has no mode bits: put it under `%LOCALAPPDATA%` and the per-user ACL of that directory does the work.
 
 ## Contract revision 5
 
@@ -185,7 +227,9 @@ cmake -S . -B build && cmake --build build && ctest --test-dir build      # also
 datagram codecs, a fuzz of malformed datagrams (20000 random and 20000 mutated, plus every prefix of every valid
 one; and 30000 junk datagrams at a live host), a fuzz of 100000 mutated control lines, the JSON corpus, live
 sessions over loopback (handshake, state flow, bye, busy, rejected hellos, the watchdog, reconnecting, foreign
-addresses, small event arrays, the allocation count), every revision 5 case, and the seqlock under contention
+addresses, small event arrays, the allocation count), every revision 5 case, the token (the comparison, the generator, the
+endpoint file's round trip, permissions and replacement, a live host that writes and removes its file, a guest that
+reads it again for each attempt, secrecy of both tokens in every reason and error), and the seqlock under contention
 (a writer thread lapping a two-slot file against a reader thread; it also shows that the same copy without the
 lock check does tear).
 
@@ -194,7 +238,7 @@ lock check does tear).
 `tests/vectors/link/` holds test vectors for the link protocol that all four implementations (Rust in
 rewrite-bridge, `link-java`, this one, `link-cs`) run in their own test suites: control lines to decode, ignore,
 reject or encode, UDP datagrams as hex, pixel files to open, read and write, and scripted sessions over real
-sockets against one side of the link. They are derived from `docs/CONTRACT.md` alone, with an encoder of their own,
+sockets against one side of the link, and endpoint files (revision 6). They are derived from `docs/CONTRACT.md` alone, with an encoder of their own,
 so a vector that this implementation fails is a place where it disagrees with the contract. The directory is a
 copy of rewrite-bridge's `tests/vectors/link/` (without `gen.py`); `README.md` and `GAPS.md` in it describe the
 formats and what the contract leaves open. Do not edit the copy.
@@ -225,6 +269,10 @@ build/interop_peer host  --port 47810 --label c &
 build/interop_peer guest --port 47810 --label c
 ```
 
+With `--endpoint FILE` (revision 6) the host makes a token and writes `FILE` (use `--port 0`) and the guest reads it;
+`--expect-unauthorized` (host) and `--wrong-token` (guest) run the mode in which the guest's token is wrong and the host must
+refuse it. The peer never prints a token.
+
 The last line on stdout is `RBL-INTEROP-RESULT {json}`; the exit status is 0 if every check passed, 1 if one failed,
 2 for a bad command line. rewrite-bridge's `tests/interop/run.sh` starts it with `RBL_PEER_C="build/interop_peer"`
 (or builds it with `make build/interop_peer` for you when you pass `--build`).
@@ -249,7 +297,9 @@ tests/interop.sh
 - Developed and tested on macOS (arm64, clang). The Windows code (Winsock, `MapViewOfFile`, the MSVC atomics) was
   written against the documentation and syntax-checked against stand-in headers, **not compiled with MSVC or run
   on Windows**; the CI workflow builds and tests it there, but this repository has not been pushed, so it has not
-  run yet. GCC on Linux has not been tried either.
+  run yet. GCC on Linux has not been tried either. The revision 6 Windows code (`BCryptGenRandom`, `CreateFileW` with
+  `CREATE_NEW`, `MoveFileExW`, `GetFileType`) is equally untested; `bcrypt` is linked by the CMake target and by the
+  `#pragma comment` for MSVC.
 - Winsock: each link calls `WSAStartup` and, when it is closed, `WSACleanup`; Windows counts them. If your own code uses sockets, hold your own `WSAStartup`
   reference (any game that uses Winsock does), or the last `rbl_link_close()` shuts Winsock down under your sockets.
 - Big-endian hosts: the datagram and JSON codecs are byte-order clean; the pixel file path swaps the lock word and

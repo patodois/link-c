@@ -35,6 +35,7 @@ static void t_lib_free(void* p) { if (p) g_lib_frees++; free(p); }
 #include "../rewrite_link.h"
 
 #if !RBLI_WINDOWS
+#include <dirent.h>
 #include <pthread.h>
 #endif
 
@@ -2100,6 +2101,446 @@ TEST(fuzz_a_live_host_with_junk_datagrams_and_lines) {
     rbl_link_close(host);
 }
 
+/* ------------------------------------------------------------------ revision 6: the token and the endpoint file */
+
+#define SECRET_HOST "tok-secret-HOST-7f3a91"
+#define SECRET_GUEST "tok-secret-GUEST-c1d4e8"
+
+TEST(token_equal_is_the_contracts_comparison) {
+    unsigned char a[300], b[300];
+    size_t i;
+    CHECK(rbl_token_equal("abc", 3, "abc", 3));
+    CHECK(!rbl_token_equal("abc", 3, "xbc", 3));      /* differs at the first byte */
+    CHECK(!rbl_token_equal("abc", 3, "abx", 3));      /* differs at the last byte */
+    CHECK(!rbl_token_equal("abc", 3, "ab", 2));       /* a prefix */
+    CHECK(!rbl_token_equal("ab", 2, "abc", 3));
+    CHECK(!rbl_token_equal("abc", 3, "abcd", 4));     /* longer */
+    CHECK(!rbl_token_equal("ab", 2, "ab\0", 3));      /* zero padding is not content: the lengths are compared too */
+    CHECK(!rbl_token_equal("", 0, "a", 1));
+    CHECK(rbl_token_equal("", 0, "", 0));             /* true for the function; a handshake refuses an empty token first */
+    CHECK(rbl_token_equal(NULL, 0, NULL, 0));
+    CHECK(!rbl_token_equal(NULL, 1, "a", 1));         /* a missing buffer is no token */
+    for (i = 0; i < sizeof a; i++) { a[i] = (unsigned char)('a' + i % 26); b[i] = a[i]; }
+    CHECK(rbl_token_equal(a, 256, b, 256));           /* 256 against 256, equal */
+    b[255] ^= 1;
+    CHECK(!rbl_token_equal(a, 256, b, 256));          /* the last byte of the 256 */
+    b[255] ^= 1;
+    CHECK(!rbl_token_equal(a, 257, b, 256));          /* a 257-byte token that starts with ours is not ours */
+    CHECK(!rbl_token_equal(a, 256, b, 257));
+    CHECK(!rbl_token_equal(a, 257, b, 257));          /* equal content, but above 256: always false */
+    CHECK(!rbl_token_equal(a, 300, b, 300));
+    b[0] ^= 1;
+    CHECK(!rbl_token_equal(a, 1, b, 1));
+}
+
+TEST(generate_token_gives_64_lowercase_hex_digits_and_a_new_one_each_time) {
+    char t1[65], t2[65];
+    size_t i;
+    memset(t1, 'z', sizeof t1);
+    CHECK_EQ(rbl_generate_token(t1), RBL_OK);
+    CHECK_EQ(rbl_generate_token(t2), RBL_OK);
+    CHECK_EQ(strlen(t1), 64); CHECK_EQ(strlen(t2), 64);
+    for (i = 0; i < 64; i++) CHECK((t1[i] >= '0' && t1[i] <= '9') || (t1[i] >= 'a' && t1[i] <= 'f'));
+    CHECK(strcmp(t1, t2) != 0);
+    CHECK_EQ(rbl_generate_token(NULL), RBL_ERR_ARGS);
+}
+
+/* a directory of its own for the endpoint tests */
+static int ep_dir(char* dir, size_t cap, int n) {
+    char base[900];
+    if (rbl_temp_dir(base, sizeof base) < 0) return 0;
+    snprintf(dir, cap, "%srbl-ep-%u-%llu-%d", base, rbli_pid(), (unsigned long long)rbl_now_us(), n);
+#if RBLI_WINDOWS
+    return CreateDirectoryA(dir, NULL) != 0;
+#else
+    return mkdir(dir, 0700) == 0;
+#endif
+}
+static void ep_path(char* out, size_t cap, const char* dir, const char* name) {
+#if RBLI_WINDOWS
+    snprintf(out, cap, "%s\\%s", dir, name);
+#else
+    snprintf(out, cap, "%s/%s", dir, name);
+#endif
+}
+static int ep_count_entries(const char* dir) {
+    int n = 0;
+#if RBLI_WINDOWS
+    WIN32_FIND_DATAA fd;
+    char pat[1300];
+    HANDLE h;
+    snprintf(pat, sizeof pat, "%s\\*", dir);
+    h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    do { if (strcmp(fd.cFileName, ".") && strcmp(fd.cFileName, "..")) n++; } while (FindNextFileA(h, &fd));
+    FindClose(h);
+#else
+    DIR* d = opendir(dir);
+    struct dirent* e;
+    if (!d) return -1;
+    while ((e = readdir(d)) != NULL) if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) n++;
+    closedir(d);
+#endif
+    return n;
+}
+static void ep_rm(const char* path) {
+#if RBLI_WINDOWS
+    DeleteFileA(path);
+#else
+    unlink(path);
+#endif
+}
+static void ep_rmdir(const char* dir) {
+#if RBLI_WINDOWS
+    RemoveDirectoryA(dir);
+#else
+    rmdir(dir);
+#endif
+}
+
+TEST(endpoint_file_round_trip_replace_and_no_temp_file_left) {
+    char dir[1100], path[1300], tok[257], big[300];
+    uint16_t port = 0;
+#if !RBLI_WINDOWS
+    struct stat st;
+#endif
+    REQUIRE(ep_dir(dir, sizeof dir, 1));
+    ep_path(path, sizeof path, dir, "game.json");
+    CHECK_EQ(rbl_endpoint_write(path, 47800, "0123456789abcdef"), RBL_OK);
+    CHECK_EQ(rbl_endpoint_read(path, &port, tok), RBL_OK);
+    CHECK_EQ(port, 47800); CHECK_STR(tok, "0123456789abcdef");
+    CHECK_EQ(ep_count_entries(dir), 1); /* only the file: the temporary one was renamed away */
+#if !RBLI_WINDOWS
+    REQUIRE(stat(path, &st) == 0);
+    CHECK_EQ(st.st_mode & 0777, 0600);  /* owner only; it was created that way, not chmod-ed later */
+#endif
+    /* replaces what is there, with a token that needs escaping and has multi-byte characters */
+    CHECK_EQ(rbl_endpoint_write(path, 1, "q\"u\\o\nte-\xC3\xA9"), RBL_OK);
+    CHECK_EQ(rbl_endpoint_read(path, &port, tok), RBL_OK);
+    CHECK_EQ(port, 1); CHECK_STR(tok, "q\"u\\o\nte-\xC3\xA9");
+    CHECK_EQ(ep_count_entries(dir), 1);
+    /* the longest token */
+    memset(big, 't', 256); big[256] = 0;
+    CHECK_EQ(rbl_endpoint_write(path, 65535, big), RBL_OK);
+    CHECK_EQ(rbl_endpoint_read(path, &port, tok), RBL_OK);
+    CHECK_EQ(port, 65535); CHECK_STR(tok, big);
+    /* refused arguments write nothing and change nothing */
+    big[256] = 't'; big[257] = 0;
+    CHECK_EQ(rbl_endpoint_write(path, 5, big), RBL_ERR_ARGS);
+    CHECK_EQ(rbl_endpoint_write(path, 5, ""), RBL_ERR_ARGS);
+    CHECK_EQ(rbl_endpoint_write(path, 5, "\xFF"), RBL_ERR_ARGS);
+    CHECK_EQ(rbl_endpoint_write(path, 0, "abc"), RBL_ERR_ARGS);
+    CHECK_EQ(rbl_endpoint_write(path, 5, NULL), RBL_ERR_ARGS);
+    CHECK_EQ(rbl_endpoint_write(NULL, 5, "abc"), RBL_ERR_ARGS);
+    CHECK_EQ(rbl_endpoint_read(path, &port, tok), RBL_OK);
+    CHECK_EQ(port, 65535);
+    CHECK_EQ(ep_count_entries(dir), 1);
+    /* the directory is not created */
+    {   char deep[1400];
+        ep_path(deep, sizeof deep, dir, "missing");
+        ep_path(deep, sizeof deep, deep, "game.json");
+        CHECK_EQ(rbl_endpoint_write(deep, 5, "abc"), RBL_ERR_IO);
+        CHECK_EQ(ep_count_entries(dir), 1);
+    }
+    /* a path that is a directory cannot be replaced: the error leaves no temporary file behind */
+    {   char sub[1400];
+        ep_path(sub, sizeof sub, dir, "sub");
+#if RBLI_WINDOWS
+        CreateDirectoryA(sub, NULL);
+#else
+        mkdir(sub, 0700);
+#endif
+        CHECK(rbl_endpoint_write(sub, 5, "abc") != RBL_OK);
+        CHECK_EQ(ep_count_entries(dir), 2);
+        ep_rmdir(sub);
+    }
+    CHECK_EQ(rbl_endpoint_remove(path), RBL_OK);
+    CHECK_EQ(rbl_endpoint_remove(path), RBL_OK); /* gone already: not an error */
+    CHECK_EQ(ep_count_entries(dir), 0);
+    CHECK(rbl_endpoint_read(path, &port, tok) == RBL_ERR_IO && port == 0 && tok[0] == 0);
+    ep_rmdir(dir);
+}
+
+#if !RBLI_WINDOWS
+TEST(endpoint_reader_refuses_a_file_others_can_read) {
+    char dir[1100], path[1300], tok[257];
+    uint16_t port;
+    const char* modes_bad[] = { "0644", "0640", "0602", "0660", "0666" };
+    size_t i;
+    REQUIRE(ep_dir(dir, sizeof dir, 2));
+    ep_path(path, sizeof path, dir, "game.json");
+    CHECK_EQ(rbl_endpoint_write(path, 47800, "abc"), RBL_OK);
+    for (i = 0; i < sizeof modes_bad / sizeof modes_bad[0]; i++) {
+        CHECK(chmod(path, (mode_t)strtol(modes_bad[i], NULL, 8)) == 0);
+        CHECK_EQ(rbl_endpoint_read(path, &port, tok), RBL_ERR_REFUSED);
+        CHECK(port == 0 && tok[0] == 0);
+    }
+    CHECK(chmod(path, 0400) == 0);
+    CHECK_EQ(rbl_endpoint_read(path, &port, tok), RBL_OK);
+    ep_rm(path);
+    ep_rmdir(dir);
+}
+#endif
+
+TEST(config_defaults_and_bad_tokens) {
+    rbl_config c;
+    rbl_link* l = NULL;
+    char big[300], *heap;
+    rbl_config_init(&c, "x");
+    CHECK(c.token == NULL); CHECK(c.endpoint_file == NULL);
+    c.control_port = 0;
+    c.token = "";
+    CHECK_EQ(rbl_link_host(&c, &l), RBL_ERR_ARGS); CHECK(l == NULL);
+    CHECK_EQ(rbl_link_guest(&c, &l), RBL_ERR_ARGS); CHECK(l == NULL);
+    memset(big, 'a', 257); big[257] = 0;
+    c.token = big;
+    CHECK_EQ(rbl_link_host(&c, &l), RBL_ERR_ARGS); CHECK(l == NULL);
+    c.token = "\xC3"; /* not UTF-8: the encoder would change it, and it would never match */
+    CHECK_EQ(rbl_link_host(&c, &l), RBL_ERR_ARGS); CHECK(l == NULL);
+    memset(big, 'a', 256); big[256] = 0; /* 256 bytes are fine */
+    c.token = big;
+    CHECK_EQ(rbl_link_host(&c, &l), RBL_OK); rbl_link_close(l);
+    {   int i; for (i = 0; i < 127; i++) big[2 * i] = (char)0xC3, big[2 * i + 1] = (char)0xA9; } /* 254 bytes of e-acute */
+    big[254] = 'a'; big[255] = 'b'; big[256] = 0;
+    c.token = big;
+    CHECK_EQ(rbl_link_host(&c, &l), RBL_OK); rbl_link_close(l);
+    c.token = NULL;
+    c.endpoint_file = "";
+    CHECK_EQ(rbl_link_host(&c, &l), RBL_ERR_ARGS); CHECK(l == NULL);
+    /* the library copies both strings: they need not outlive the call */
+    heap = (char*)malloc(32);
+    REQUIRE(heap);
+    strcpy(heap, "short-lived-token");
+    c.endpoint_file = NULL;
+    c.token = heap;
+    REQUIRE(rbl_link_host(&c, &l) == RBL_OK);
+    memset(heap, 'X', 31); free(heap);
+    c.token = NULL;
+    rbl_link_close(l);
+}
+
+TEST(a_host_with_an_endpoint_file_writes_it_after_binding_and_removes_it_on_close) {
+    char dir[1100], path[1300], tok[257], tok2[257];
+    uint16_t port = 0;
+    rbl_config h, g;
+    rbl_link *host = NULL, *guest = NULL;
+    Col hc, gc;
+    char* epath;
+    int ok;
+    REQUIRE(ep_dir(dir, sizeof dir, 3));
+    ep_path(path, sizeof path, dir, "game.json");
+    memset(&hc, 0, sizeof hc); memset(&gc, 0, sizeof gc);
+    epath = (char*)malloc(strlen(path) + 1);
+    REQUIRE(epath);
+    strcpy(epath, path);
+    rbl_config_init(&h, "Token Host"); h.control_port = 0; h.endpoint_file = epath;
+    REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
+    memset(epath, 'X', strlen(epath)); free(epath); /* the host kept its own copy */
+    /* the file is there at once, with the port that was bound (0 was asked for) and a generated token */
+    REQUIRE(rbl_endpoint_read(path, &port, tok) == RBL_OK);
+    CHECK_EQ(port, rbl_link_control_port(host)); CHECK(port != 0);
+    CHECK_EQ(strlen(tok), 64);
+    /* a guest that only knows the file connects */
+    rbl_config_init(&g, "Token Guest"); g.endpoint_file = path; g.reconnect_ms = 100; g.control_port = 1; /* the port in cfg is not used */
+    REQUIRE(rbl_link_guest(&g, &guest) == RBL_OK);
+    WAIT_UNTIL(4000, (col_poll(host, &hc), col_poll(guest, &gc)), rbl_link_is_connected(host) && rbl_link_is_connected(guest), ok);
+    CHECK(ok);
+    CHECK_EQ(hc.hsfail, 0); CHECK_EQ(gc.hsfail, 0);
+    /* the token never shows in the peer info or the stats: the file is still the same */
+    CHECK_EQ(rbl_endpoint_read(path, &port, tok2), RBL_OK); CHECK_STR(tok, tok2);
+    rbl_link_close(guest);
+    CHECK_EQ(ep_count_entries(dir), 1);
+    rbl_link_close(host);
+    CHECK_EQ(ep_count_entries(dir), 0); /* removed when the link is closed */
+    ep_rmdir(dir);
+}
+
+TEST(a_host_with_a_configured_token_writes_that_token_to_the_file) {
+    char dir[1100], path[1300], tok[257];
+    uint16_t port;
+    rbl_config h;
+    rbl_link* host = NULL;
+    REQUIRE(ep_dir(dir, sizeof dir, 4));
+    ep_path(path, sizeof path, dir, "game.json");
+    rbl_config_init(&h, "Host"); h.control_port = 0; h.endpoint_file = path; h.token = "launcher-chosen-token";
+    REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
+    REQUIRE(rbl_endpoint_read(path, &port, tok) == RBL_OK);
+    CHECK_STR(tok, "launcher-chosen-token");
+    rbl_link_close(host);
+    CHECK_EQ(ep_count_entries(dir), 0);
+    ep_rmdir(dir);
+}
+
+TEST(a_host_whose_endpoint_file_cannot_be_written_is_not_created) {
+    char dir[1100], path[1300], deep[1400];
+    rbl_config h, h2;
+    rbl_link* host = NULL;
+    rbl_link* other = NULL;
+    int rc;
+    REQUIRE(ep_dir(dir, sizeof dir, 5));
+    ep_path(path, sizeof path, dir, "game.json");
+    ep_path(deep, sizeof deep, dir, "missing");
+    ep_path(deep, sizeof deep, deep, "game.json");
+    rbl_config_init(&h, "Host"); h.control_port = 0; h.endpoint_file = deep; h.token = SECRET_HOST;
+    rc = rbl_link_host(&h, &host);
+    CHECK_EQ(rc, RBL_ERR_IO); CHECK(host == NULL);
+    CHECK(strstr(rbl_strerror(rc), SECRET_HOST) == NULL);
+    CHECK_EQ(ep_count_entries(dir), 0);
+    rbl_config_init(&h2, "Host"); h2.control_port = 0;
+    REQUIRE(rbl_link_host(&h2, &other) == RBL_OK);
+    /* a process that holds the port first (a squatter): the bind fails, so no file is written and a guest that reads
+     * the file is never sent to the squatter with a token */
+    h.control_port = rbl_link_control_port(other); h.endpoint_file = path; /* the directory exists now */
+    host = NULL;
+    rc = rbl_link_host(&h, &host);
+    CHECK_EQ(rc, RBL_ERR_IO); CHECK(host == NULL);
+    CHECK_EQ(ep_count_entries(dir), 0);
+    rbl_link_close(other);
+    ep_rmdir(dir);
+}
+
+TEST(a_guest_without_an_endpoint_file_waits_quietly_and_reads_it_again_for_every_attempt) {
+    char dir[1100], path[1300];
+    rbl_config h, g;
+    rbl_link *host = NULL, *guest = NULL;
+    Col hc, gc;
+    int ok;
+    uint16_t first_port;
+    char first_tok[257], tok[257];
+    uint16_t port;
+    REQUIRE(ep_dir(dir, sizeof dir, 6));
+    ep_path(path, sizeof path, dir, "game.json");
+    memset(&hc, 0, sizeof hc); memset(&gc, 0, sizeof gc);
+    rbl_config_init(&g, "Guest"); g.endpoint_file = path; g.reconnect_ms = 50;
+    REQUIRE(rbl_link_guest(&g, &guest) == RBL_OK);
+    /* no file: no attempt, no event, for a good while */
+    WAIT_UNTIL(500, col_poll(guest, &gc), gc.hsfail || gc.lost || gc.connected, ok);
+    CHECK(!ok); CHECK(!rbl_link_is_connected(guest));
+    /* the host starts: the guest finds the file and connects */
+    rbl_config_init(&h, "Host"); h.control_port = 0; h.endpoint_file = path;
+    REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
+    WAIT_UNTIL(4000, (col_poll(host, &hc), col_poll(guest, &gc)), rbl_link_is_connected(host) && rbl_link_is_connected(guest), ok);
+    REQUIRE(ok);
+    first_port = rbl_link_control_port(host);
+    REQUIRE(rbl_endpoint_read(path, &port, first_tok) == RBL_OK);
+    /* the host restarts with another port and token; the file is read again before the guest's next attempt */
+    rbl_link_close(host);
+    host = NULL;
+    WAIT_UNTIL(3000, col_poll(guest, &gc), !rbl_link_is_connected(guest), ok);
+    CHECK(ok);
+    REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
+    REQUIRE(rbl_endpoint_read(path, &port, tok) == RBL_OK);
+    CHECK(strcmp(tok, first_tok) != 0);
+    (void)first_port;
+    WAIT_UNTIL(5000, (col_poll(host, &hc), col_poll(guest, &gc)), rbl_link_is_connected(host) && rbl_link_is_connected(guest), ok);
+    CHECK(ok);
+    rbl_link_close(guest);
+    rbl_link_close(host);
+    CHECK_EQ(ep_count_entries(dir), 0);
+    ep_rmdir(dir);
+}
+
+TEST(a_guest_with_a_wrong_token_is_unauthorized_and_no_secret_shows) {
+    rbl_config h, g;
+    rbl_link *host = NULL, *guest = NULL;
+    Col hc, gc;
+    int ok;
+    char reasons[1000];
+    memset(&hc, 0, sizeof hc); memset(&gc, 0, sizeof gc);
+    rbl_config_init(&h, "Host"); h.control_port = 0; h.token = SECRET_HOST;
+    REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
+    rbl_config_init(&g, "Guest"); g.control_port = rbl_link_control_port(host); g.token = SECRET_GUEST; g.reconnect_ms = 100;
+    REQUIRE(rbl_link_guest(&g, &guest) == RBL_OK);
+    WAIT_UNTIL(3000, (col_poll(host, &hc), col_poll(guest, &gc)), hc.hsfail > 0 && gc.hsfail > 0, ok);
+    REQUIRE(ok);
+    CHECK_STR(hc.hsfail_reason, "unauthorized");               /* the host's event: exactly the word */
+    CHECK(strstr(gc.hsfail_reason, "unauthorized") != NULL);    /* the guest's: "peer said bye: unauthorized" */
+    CHECK_EQ(hc.connected, 0); CHECK_EQ(gc.connected, 0);
+    snprintf(reasons, sizeof reasons, "%s|%s|%s|%s", hc.hsfail_reason, gc.hsfail_reason, hc.lost_reason, gc.lost_reason);
+    CHECK(strstr(reasons, SECRET_HOST) == NULL); CHECK(strstr(reasons, SECRET_GUEST) == NULL);
+    rbl_link_close(guest);
+    rbl_link_close(host);
+}
+
+TEST(a_host_with_a_token_answers_a_raw_hello_with_the_fixed_bye_and_never_sends_a_token) {
+    static const char* wrong[] = { NULL, SECRET_GUEST, "tok-secret-HOST-7f3a9", "tok-secret-HOST-7f3a91x", "", "TOK-SECRET-HOST-7F3A91" };
+    size_t i;
+    for (i = 0; i < sizeof wrong / sizeof wrong[0]; i++) {
+        rbl_config h;
+        rbl_link* host = NULL;
+        Col c;
+        Raw r;
+        char line[600], hello[600];
+        memset(&c, 0, sizeof c);
+        rbl_config_init(&h, "Host"); h.control_port = 0; h.token = SECRET_HOST;
+        REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
+        REQUIRE(raw_open(&r, rbl_link_control_port(host)));
+        if (wrong[i])
+            snprintf(hello, sizeof hello, "{\"type\":\"hello\",\"role\":\"guest\",\"game\":\"raw\",\"protocol\":1,\"min_protocol\":1,\"udp_port\":%u,"
+                     "\"heartbeat_ms\":250,\"timeout_ms\":2000,\"token\":\"%s\"}\n", (unsigned)r.udp_port, wrong[i]);
+        else
+            snprintf(hello, sizeof hello, "{\"type\":\"hello\",\"role\":\"guest\",\"game\":\"raw\",\"protocol\":1,\"min_protocol\":1,\"udp_port\":%u,"
+                     "\"heartbeat_ms\":250,\"timeout_ms\":2000}\n", (unsigned)r.udp_port);
+        raw_send(&r, hello);
+        REQUIRE(raw_wait_line(&r, host, &c, 3000, line, sizeof line));
+        CHECK_STR(line, "{\"type\":\"bye\",\"reason\":\"unauthorized\"}");
+        CHECK(raw_wait_eof(&r, host, &c, 2000));
+        CHECK_EQ(c.hsfail, 1); CHECK_EQ(c.connected, 0);
+        CHECK_STR(c.hsfail_reason, "unauthorized");
+        raw_close(&r);
+        rbl_link_close(host);
+    }
+    {   /* the right token: the host's hello has no token field, and the session starts */
+        rbl_config h;
+        rbl_link* host = NULL;
+        Col c;
+        Raw r;
+        char line[600], hello[600];
+        memset(&c, 0, sizeof c);
+        rbl_config_init(&h, "Host"); h.control_port = 0; h.token = SECRET_HOST;
+        REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
+        REQUIRE(raw_open(&r, rbl_link_control_port(host)));
+        snprintf(hello, sizeof hello, "{\"type\":\"hello\",\"role\":\"guest\",\"game\":\"raw\",\"protocol\":1,\"min_protocol\":1,\"udp_port\":%u,"
+                 "\"heartbeat_ms\":250,\"timeout_ms\":2000,\"token\":\"%s\"}\n", (unsigned)r.udp_port, SECRET_HOST);
+        raw_send(&r, hello);
+        REQUIRE(raw_wait_line(&r, host, &c, 3000, line, sizeof line));
+        CHECK(strncmp(line, "{\"type\":\"hello\",\"role\":\"host\"", 28) == 0);
+        CHECK(strstr(line, "token") == NULL);
+        CHECK(strstr(line, SECRET_HOST) == NULL);
+        CHECK_EQ(c.connected, 1);
+        raw_close(&r);
+        rbl_link_close(host);
+    }
+}
+
+TEST(a_hello_keeps_the_whole_token_whatever_its_length) {
+    char line[1000];
+    rbl_control c;
+    const char* why = NULL;
+    size_t i;
+    int n;
+    char out[1200];
+    strcpy(line, "{\"type\":\"hello\",\"role\":\"guest\",\"game\":\"g\",\"protocol\":1,\"min_protocol\":1,\"udp_port\":5,"
+                 "\"heartbeat_ms\":250,\"timeout_ms\":2000,\"token\":\"");
+    n = (int)strlen(line);
+    for (i = 0; i < 300; i++) line[n++] = (char)('a' + i % 26);
+    strcpy(line + n, "\"}\n");
+    REQUIRE(rbl_control_parse(line, strlen(line), &c, &why) == RBL_OK);
+    CHECK(c.u.hello.has_token); CHECK_EQ(c.u.hello.token.len, 300); /* not cut at 256: the handshake decides */
+    CHECK(c.u.hello.token.ptr[299] == (char)('a' + 299 % 26));
+    CHECK(!rbl_token_equal(c.u.hello.token.ptr, c.u.hello.token.len, c.u.hello.token.ptr, c.u.hello.token.len));
+    /* encoding writes `token` only when there is one */
+    n = rbl_control_format(&c, out, sizeof out - 1);
+    REQUIRE(n > 0);
+    out[n] = 0;
+    CHECK(strstr(out, "\"token\":\"") != NULL);
+    c.u.hello.has_token = 0;
+    n = rbl_control_format(&c, out, sizeof out - 1);
+    REQUIRE(n > 0);
+    out[n] = 0;
+    CHECK(strstr(out, "token") == NULL);
+}
+
 TEST(the_library_frees_everything_it_allocated) {
     printf("     %lu allocations, %lu frees\n", (unsigned long)g_lib_allocs, (unsigned long)g_lib_frees);
     CHECK(g_lib_allocs > 100);
@@ -2165,6 +2606,20 @@ int main(void) {
     RUN(poll_with_a_small_array_loses_nothing);
     RUN(a_snapshot_above_the_receivers_limit_is_dropped);
     RUN(fuzz_a_live_host_with_junk_datagrams_and_lines);
+    RUN(token_equal_is_the_contracts_comparison);
+    RUN(generate_token_gives_64_lowercase_hex_digits_and_a_new_one_each_time);
+    RUN(endpoint_file_round_trip_replace_and_no_temp_file_left);
+#if !RBLI_WINDOWS
+    RUN(endpoint_reader_refuses_a_file_others_can_read);
+#endif
+    RUN(config_defaults_and_bad_tokens);
+    RUN(a_host_with_an_endpoint_file_writes_it_after_binding_and_removes_it_on_close);
+    RUN(a_host_with_a_configured_token_writes_that_token_to_the_file);
+    RUN(a_host_whose_endpoint_file_cannot_be_written_is_not_created);
+    RUN(a_guest_without_an_endpoint_file_waits_quietly_and_reads_it_again_for_every_attempt);
+    RUN(a_guest_with_a_wrong_token_is_unauthorized_and_no_secret_shows);
+    RUN(a_host_with_a_token_answers_a_raw_hello_with_the_fixed_bye_and_never_sends_a_token);
+    RUN(a_hello_keeps_the_whole_token_whatever_its_length);
     RUN(the_library_frees_everything_it_allocated);
     printf("\n%d passed, %d failed\n", g_passed, g_failed);
     return g_failed == 0 ? 0 : 1;

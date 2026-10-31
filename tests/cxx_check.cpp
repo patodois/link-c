@@ -27,5 +27,9 @@ int main() {
     h.version = RBL_VERSION; h.session = 0xABCD0001u; h.seq = 4; h.time_us = 1700000000000000ull;
     int len = rbl_wire_encode_heartbeat(&h, buf, sizeof buf);
     rbl_link_close(host);
-    return (n >= 0 && len == 24 && other_unit_uses_the_api() == 0) ? 0 : 1;
+    // revision 6: the token API from C++
+    char tok[65];
+    bool token_ok = rbl_generate_token(tok) == RBL_OK && std::strlen(tok) == 64 && rbl_token_equal(tok, 64, tok, 64) &&
+                    !rbl_token_equal(tok, 64, tok, 63) && cfg.token == nullptr && cfg.endpoint_file == nullptr;
+    return (n >= 0 && len == 24 && token_ok && other_unit_uses_the_api() == 0) ? 0 : 1;
 }

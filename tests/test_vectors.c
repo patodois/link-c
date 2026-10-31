@@ -1,5 +1,5 @@
 /* Runs the shared link test vectors (tests/vectors/link, see the README there) against rewrite_link.h:
- * control lines, datagrams, pixel files and scripted sessions over real sockets.
+ * control lines, datagrams, pixel files, scripted sessions over real sockets and endpoint files (revision 6).
  *
  * The vectors are derived from docs/CONTRACT.md of the rewrite-bridge repository alone and are the same
  * files the Rust, Java and C# implementations run, so a vector this file fails is a place where this
@@ -55,7 +55,7 @@
  *     scripts/sync-link-vectors.sh <path of this repository>
  * (it copies the directory and prints "VECTORS_DIGEST = <hex>"), paste the hex here, then run `make test`
  * and re-check KNOWN_DISAGREEMENTS. */
-#define VECTORS_DIGEST "815d4f09e6d15f17dfcfedcf96865c5cfd60e170d3f71fb97f3adc0edc200fd9"
+#define VECTORS_DIGEST "1d64e93423f3be8b152260ad93c11f0c5459fa942be6912f3aeda13b3e66649f"
 
 /* Vectors this implementation fails: { id, why }, the list ends with { NULL, NULL }. */
 static const struct { const char* id; const char* why; } KNOWN_DISAGREEMENTS[] = {
@@ -815,6 +815,7 @@ static void control_from_jv(const JV* m, rbl_control* c) {
         c->u.hello.heartbeat_ms = ju32k(m, "heartbeat_ms");
         c->u.hello.timeout_ms = ju32k(m, "timeout_ms");
         if ((o = jv_get(m, "session")) != NULL) { c->u.hello.has_session = 1; c->u.hello.session = ju32(o); }
+        if ((o = jv_get(m, "token")) != NULL) { c->u.hello.has_token = 1; c->u.hello.token = rstr(o); }
     } else if (strcmp(type, "spawn") == 0) {
         c->type = RBL_CTL_SPAWN;
         c->u.spawn.entity = ju32k(m, "entity");
@@ -855,6 +856,7 @@ static JV control_to_jv(const rbl_control* c) {
         jv_set(&o, "heartbeat_ms", jv_num(c->u.hello.heartbeat_ms, 1));
         jv_set(&o, "timeout_ms", jv_num(c->u.hello.timeout_ms, 1));
         if (c->u.hello.has_session) jv_set(&o, "session", jv_num(c->u.hello.session, 1));
+        if (c->u.hello.has_token) jv_set(&o, "token", jv_rstr(c->u.hello.token));
         break;
     case RBL_CTL_SPAWN:
         jv_set(&o, "type", jv_cstr("spawn"));
@@ -2389,6 +2391,7 @@ static int sess_open(Sess* s, const JV* c, const JV* dgrams) {
     cfg.heartbeat_ms = conf && jv_get(conf, "heartbeat_ms") ? ju32k(conf, "heartbeat_ms") : 250u;
     cfg.timeout_ms = conf && jv_get(conf, "timeout_ms") ? ju32k(conf, "timeout_ms") : 2000u;
     cfg.reconnect_ms = conf && jv_get(conf, "reconnect_ms") ? ju32k(conf, "reconnect_ms") : 200u;
+    if (conf && jv_get(conf, "token")) cfg.token = jstr(conf, "token"); /* the library copies it: the JV need not outlive the call */
     rc = s->host ? rbl_link_host(&cfg, &s->ut) : rbl_link_guest(&cfg, &s->ut);
     if (rc != RBL_OK) { s->ut = NULL; return failf("cannot create the %s: %s", s->host ? "host" : "guest", rbl_strerror(rc)); }
     s->ut_udp = rbl_link_udp_port(s->ut);
@@ -2425,11 +2428,112 @@ static void test_sessions(const JV* cases, const JV* dgrams) {
     finish(&r, "sessions.json");
 }
 
+/* ------------------------------------------------------------------ endpoints.json (revision 6, section 6.2) */
+
+/* the TOKEN of the vectors; the reader's errors must not contain it */
+#define VECTOR_TOKEN "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+static const char* platform_name(void) {
+#if RBLI_WINDOWS
+    return "windows";
+#elif defined(__APPLE__)
+    return "macos";
+#else
+    return "linux";
+#endif
+}
+
+static int skipped_here(const JV* c) {
+    const JV* so = jv_get(c, "skip_on");
+    size_t i;
+    for (i = 0; so && so->t == J_ARR && i < so->n; i++)
+        if (so->v[i].t == J_STR && strcmp(so->v[i].s, platform_name()) == 0) return 1;
+    return 0;
+}
+
+static int write_bytes(const char* path, const uint8_t* b, size_t n) {
+    FILE* f = fopen(path, "wb");
+    if (!f) return -1;
+    if (n && fwrite(b, 1, n, f) != n) { fclose(f); return -1; }
+    return fclose(f);
+}
+
+static int check_endpoint(const JV* c) {
+    Temp t;
+    char path[1300];
+    const char* pk = jv_get(c, "path_kind") ? jstr(c, "path_kind") : NULL;
+    const char* expect = jstr(c, "expect");
+    uint16_t port = 7;
+    char tok[257];
+    int rc, ret = 0;
+    if (skipped_here(c)) { failf("skipped on %s", platform_name()); return 2; }
+    if (temp_new(&t) != 0) return failf("cannot create a temporary directory");
+    temp_path(&t, "endpoint.json", path, sizeof path);
+    if (!pk) {
+        const JV* tj = jv_get(c, "text");
+        uint8_t* raw = NULL;
+        size_t rawn = 0;
+        int own = 0;
+        if (tj && tj->t == J_STR) { raw = (uint8_t*)tj->s; rawn = tj->len; }
+        else { const char* h = jstr(c, "text_hex"); raw = hex_decode(h, strlen(h), &rawn); own = 1; }
+        if (!raw) { format_error("bad hex in", "text_hex"); ret = failf("bad vector"); }
+        else {
+            if (write_bytes(path, raw, rawn) != 0) ret = failf("cannot write the file");
+#if !RBLI_WINDOWS
+            else if (chmod(path, (mode_t)strtol(jstr_or(c, "mode", "0600"), NULL, 8)) != 0) ret = failf("cannot set the mode");
+#endif
+            if (own) free(raw);
+        }
+    } else if (strcmp(pk, "missing") == 0) {
+        /* nothing is created */
+    } else if (strcmp(pk, "directory") == 0) {
+#if RBLI_WINDOWS
+        if (!CreateDirectoryA(path, NULL)) ret = failf("cannot create a directory");
+#else
+        if (mkdir(path, 0700) != 0) ret = failf("cannot create a directory");
+#endif
+    } else if (strcmp(pk, "fifo") == 0) {
+#if RBLI_WINDOWS
+        ret = failf("no FIFO here");
+#else
+        if (mkfifo(path, 0600) != 0) ret = failf("cannot create a FIFO");
+#endif
+    } else {
+        format_error("unknown path_kind", pk);
+        ret = failf("bad vector");
+    }
+    if (ret) { temp_drop(&t); return ret; }
+
+    rc = rbl_endpoint_read(path, &port, tok);
+    if (strcmp(expect, "ok") == 0) {
+        const char* want = jstr(c, "token");
+        if (rc != RBL_OK) ret = failf("refused: %s", rbl_strerror(rc));
+        else if (port != ju32k(c, "control_port")) ret = failf("control_port is %u, expected %u", (unsigned)port, ju32k(c, "control_port"));
+        else if (strlen(tok) != strlen(want) || memcmp(tok, want, strlen(want)) != 0) ret = failf("the token differs from the expected one");
+    } else if (strcmp(expect, "refused") == 0) {
+        if (rc == RBL_OK) ret = failf("accepted the file (%s)", jstr_or(c, "why", ""));
+        else {
+            if (strstr(rbl_strerror(rc), VECTOR_TOKEN) != NULL) ret = failf("the error text contains the token");
+            else if (port != 0 || tok[0] != 0) ret = failf("a refused read left a port or a token in the outputs");
+        }
+    } else { format_error("unknown expect", expect); ret = failf("bad vector"); }
+    temp_drop(&t);
+    return ret;
+}
+
+static void test_endpoints(const JV* cases) {
+    Report r;
+    size_t i;
+    memset(&r, 0, sizeof r);
+    for (i = 0; i < cases->n; i++) record(&r, &cases->v[i], check_endpoint(&cases->v[i]));
+    finish(&r, "endpoints.json");
+}
+
 /* ------------------------------------------------------------------ main */
 
 int main(void) {
     uint64_t t0 = rbli_mono_ms(), t1;
-    JV control, dgrams, pixels, sessions;
+    JV control, dgrams, pixels, sessions, endpoints;
     Report rr;
     JV c;
     if (rbli_net_up() != 0) { fprintf(stderr, "cannot start the network layer\n"); return 2; }
@@ -2453,12 +2557,14 @@ int main(void) {
     dgrams = load_doc("datagrams.json");
     pixels = load_doc("pixelfiles.json");
     sessions = load_doc("sessions.json");
+    endpoints = load_doc("endpoints.json");
     test_control(&control);
     test_datagrams(&dgrams);
     test_pixel_readers(&pixels);
     test_pixel_writers(&pixels);
     test_sessions(&sessions, &dgrams);
-    jv_free(&control); jv_free(&dgrams); jv_free(&pixels); jv_free(&sessions);
+    test_endpoints(&endpoints);
+    jv_free(&control); jv_free(&dgrams); jv_free(&pixels); jv_free(&sessions); jv_free(&endpoints);
 
     if (g_format_errors) { printf("%d vector format errors (see above)\n", g_format_errors); g_failed_total += g_format_errors; }
     t1 = rbli_mono_ms();

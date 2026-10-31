@@ -1,11 +1,17 @@
 /* The C side of the cross-language interop test of the link (rewrite-bridge: tests/interop/README.md).
  *
- *   interop_peer host|guest --port PORT --label LABEL
+ *   interop_peer host  --port PORT --label LABEL [--endpoint FILE [--expect-unauthorized]]
+ *   interop_peer guest --port PORT --label LABEL [--endpoint FILE [--wrong-token]]
  *
  * One process plays one side of a scripted session: handshake, spawn and focus, five lock-step rounds of
  * camera / poses / collision / frames through a real pixel file with depth, despawn, bye. The host listens on
  * the control port PORT, the guest connects to it (retrying until a host answers). Both use heartbeat 100 ms
  * and timeout 3000 ms and the game name "interop host (LABEL)" / "interop guest (LABEL)".
+ *
+ * With --endpoint (contract revision 6, section 6.2) the host has a token that the library generates and writes FILE
+ * after binding (PORT is 0 then); the guest gives its library FILE and the library reads port and token from it.
+ * --expect-unauthorized / --wrong-token: the guest connects with the file's token changed in its last character and
+ * the host must refuse it with bye "unauthorized"; both report it and close. Nothing here prints a token.
  *
  * The last line on stdout is  RBL-INTEROP-RESULT {json}  and the exit status is 0 if every check passed, 1
  * if one failed (or a step waited more than 10 seconds, or 30 seconds passed), 2 for a bad command line.
@@ -60,6 +66,7 @@ typedef struct { uint32_t entity; int has; } Seen;
 
 static struct {
     int host;
+    const char* mode;       /* "plain", "token" or "wrong-token" */
     const char* label;
     rbl_link* link;
     char game[200];
@@ -71,6 +78,8 @@ static struct {
     char peer_game[160];
     uint32_t protocol, session;
     char lost_reason[200];
+    char hs_failed[8][200];
+    int nhs_failed;
     uint32_t spawns[8], despawns[8];
     int nspawns, ndespawns;
     unsigned cameras, cameras_seen, poses, poses_seen, frames_ok, frames_bad, frame_events;
@@ -328,7 +337,16 @@ static void on_event(const rbl_event* e) {
         logf_("lost: %s", G.lost_reason);
         if (!G.expect_lost) { fail("the session was lost: %s", G.lost_reason); G.fatal = 1; }
         break;
-    case RBL_EV_HANDSHAKE_FAILED: fail("the handshake failed: %s", e->u.handshake_failed.text); G.fatal = 1; break;
+    case RBL_EV_HANDSHAKE_FAILED:
+        if (G.nhs_failed < 8) snprintf(G.hs_failed[G.nhs_failed++], sizeof G.hs_failed[0], "%s", e->u.handshake_failed.text);
+        logf_("handshake failed: %s", e->u.handshake_failed.text);
+        if (strcmp(G.mode, "wrong-token") == 0) {
+            if (!strstr(e->u.handshake_failed.text, "unauthorized")) fail("the handshake failed with \"%s\", expected it to mention unauthorized", e->u.handshake_failed.text);
+        } else {
+            fail("the handshake failed: %s", e->u.handshake_failed.text);
+            G.fatal = 1;
+        }
+        break;
     case RBL_EV_CAMERA: on_camera(e); break;
     case RBL_EV_POSES: on_poses(e); break;
     case RBL_EV_COLLISION: on_collision(e); break;
@@ -470,6 +488,25 @@ done:
     return;
 }
 
+/* wrong-token mode: no session may start. The host waits for the handshake to fail, polls a little longer and closes;
+ * the guest closes as soon as its handshake has failed, before its library would try again. */
+static void run_host_unauthorized(void) {
+    uint64_t until;
+    WAIT_UNTIL("the guest's refused hello", G.nhs_failed >= 1);
+    until = rbli_mono_ms() + 300;
+    while (rbli_mono_ms() < until) { pump(); rbli_sleep_ms(2); }
+    if (G.connected) fail("a session started although the guest sent a wrong token");
+done:
+    return;
+}
+
+static void run_guest_unauthorized(void) {
+    WAIT_UNTIL("the host's bye unauthorized", G.nhs_failed >= 1);
+    if (G.connected) fail("a session started with a wrong token");
+done:
+    return;
+}
+
 /* ------------------------------------------------------------------ result */
 
 static void json_str(char* out, size_t cap, size_t* n, const char* s) {
@@ -513,7 +550,11 @@ static void print_result(const rbl_stats* st, int have_stats) {
     json_str(out, cap, &n, G.host ? "host" : "guest");
     js_add(out, cap, &n, ",\"label\":");
     json_str(out, cap, &n, G.label);
-    js_add(out, cap, &n, ",\"ok\":%s,\"failures\":[", G.nfail == 0 ? "true" : "false");
+    js_add(out, cap, &n, ",\"mode\":");
+    json_str(out, cap, &n, G.mode);
+    js_add(out, cap, &n, ",\"connected\":%s,\"handshake_failed\":[", G.connected ? "true" : "false");
+    for (i = 0; i < G.nhs_failed; i++) { if (i) js_add(out, cap, &n, ","); json_str(out, cap, &n, G.hs_failed[i]); }
+    js_add(out, cap, &n, "],\"ok\":%s,\"failures\":[", G.nfail == 0 ? "true" : "false");
     for (i = 0; i < G.nfail; i++) { if (i) js_add(out, cap, &n, ","); json_str(out, cap, &n, G.fails[i]); }
     js_add(out, cap, &n, "],\"peer_game\":");
     if (G.connected) json_str(out, cap, &n, G.peer_game); else js_add(out, cap, &n, "null");
@@ -538,7 +579,8 @@ static void print_result(const rbl_stats* st, int have_stats) {
 }
 
 static int usage(void) {
-    fprintf(stderr, "usage: interop_peer host|guest --port PORT --label LABEL\n");
+    fprintf(stderr, "usage: interop_peer host  --port PORT --label LABEL [--endpoint FILE [--expect-unauthorized]]\n"
+                    "       interop_peer guest --port PORT --label LABEL [--endpoint FILE [--wrong-token]]\n");
     return 2;
 }
 
@@ -547,6 +589,9 @@ int main(int argc, char** argv) {
     int i, rc;
     long port = -1;
     const char* label = NULL;
+    const char* endpoint = NULL;
+    int expect_unauthorized = 0, wrong_token = 0;
+    char wrong[RBL_MAX_TOKEN + 1]; /* the wrong token: a secret like the right one, never printed */
     uint64_t start = rbli_mono_ms();
     if (argc < 2 || (strcmp(argv[1], "host") != 0 && strcmp(argv[1], "guest") != 0)) return usage();
     G.host = strcmp(argv[1], "host") == 0;
@@ -554,14 +599,24 @@ int main(int argc, char** argv) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             char* end = NULL;
             port = strtol(argv[++i], &end, 10);
-            if (!end || *end || port < 1 || port > 65535) return usage();
+            if (!end || *end || port < 0 || port > 65535) return usage();
         } else if (strcmp(argv[i], "--label") == 0 && i + 1 < argc) {
             label = argv[++i];
+        } else if (strcmp(argv[i], "--endpoint") == 0 && i + 1 < argc) {
+            endpoint = argv[++i];
+        } else if (strcmp(argv[i], "--expect-unauthorized") == 0) {
+            expect_unauthorized = 1;
+        } else if (strcmp(argv[i], "--wrong-token") == 0) {
+            wrong_token = 1;
         } else {
             return usage();
         }
     }
     if (port < 0 || !label) return usage();
+    if (expect_unauthorized && (!G.host || !endpoint)) return usage();
+    if (wrong_token && (G.host || !endpoint)) return usage();
+    if (!endpoint && port < 1) return usage();
+    G.mode = wrong_token || expect_unauthorized ? "wrong-token" : endpoint ? "token" : "plain";
     G.label = label;
     G.deadline = start + TOTAL_LIMIT_MS;
     snprintf(G.game, sizeof G.game, "interop %s (%s)", G.host ? "host" : "guest", label);
@@ -572,13 +627,39 @@ int main(int argc, char** argv) {
     cfg.heartbeat_ms = 100;
     cfg.timeout_ms = 3000;
     cfg.reconnect_ms = 100;
+    if (endpoint && !wrong_token) cfg.endpoint_file = endpoint; /* the host writes it (and makes the token), the guest reads it */
+    if (wrong_token) {
+        /* read the file with the library's reader, then connect to its port with the token's last character changed, without
+         * giving the library the file (it would send the right token) */
+        char tok[257];
+        uint16_t fport = 0;
+        size_t tl;
+        int tries;
+        rc = RBL_ERR_IO;
+        for (tries = 0; tries < 200 && rc != RBL_OK; tries++) {
+            rc = rbl_endpoint_read(endpoint, &fport, tok);
+            if (rc != RBL_OK) rbli_sleep_ms(50);
+        }
+        if (rc != RBL_OK) {
+            fail("cannot read the endpoint file: %s", rbl_strerror(rc));
+            G.link = NULL;
+            goto result;
+        }
+        tl = strlen(tok);
+        memcpy(wrong, tok, tl + 1);
+        wrong[tl - 1] = wrong[tl - 1] == '0' ? '1' : '0';
+        memset(tok, 0, sizeof tok);
+        cfg.control_port = fport;
+        cfg.token = wrong;
+    }
     rc = G.host ? rbl_link_host(&cfg, &G.link) : rbl_link_guest(&cfg, &G.link);
     if (rc != RBL_OK) {
         G.link = NULL;
         fail("cannot start the %s on port %ld: %s", G.host ? "host" : "guest", port, rbl_strerror(rc));
     } else {
         logf_("%s, control port %ld, udp port %u", G.game, port, (unsigned)rbl_link_udp_port(G.link));
-        if (G.host) run_host(); else run_guest();
+        if (strcmp(G.mode, "wrong-token") == 0) { if (G.host) run_host_unauthorized(); else run_guest_unauthorized(); }
+        else if (G.host) run_host(); else run_guest();
         pump();
         if (!G.host && G.connected) {
             /* step 6 on the guest: bye, poll for 200 ms so that the closing drains; a Lost event for it would be a failure */
@@ -590,6 +671,8 @@ int main(int argc, char** argv) {
     /* the totals */
     if (G.aborted || !G.link) {
         /* nothing to add */
+    } else if (strcmp(G.mode, "wrong-token") == 0) {
+        if (G.connected) fail("a session started with a wrong token");
     } else if (G.host) {
         if (G.nspawns != 1 || G.spawns[0] != GUEST_ENTITY) fail("the guest's spawns were not exactly [7]");
         if (G.ndespawns != 1 || G.despawns[0] != GUEST_ENTITY) fail("the guest's despawns were not exactly [7]");
@@ -605,6 +688,7 @@ int main(int argc, char** argv) {
         if (G.nfocus != 2 || strcmp(G.focus[0], "guest:set") != 0 || strcmp(G.focus[1], "host:set") != 0) fail("the guest's focus events were not exactly [guest:set, host:set]");
         if (G.lost) fail("the guest got a Lost event");
     }
+result:
     print_result(&g_stats, g_have_stats);
     if (G.reader) rbl_pixel_reader_close(G.reader);
     rbl_link_close(G.link);

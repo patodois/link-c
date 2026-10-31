@@ -1,4 +1,4 @@
-/* rewrite_link.h - the rewrite-bridge passthrough link protocol v1 (revision 5), C99, single header.
+/* rewrite_link.h - the rewrite-bridge passthrough link protocol v1 (revision 6), C99, single header.
  *
  * https://github.com/patodois/link-c  -  MIT OR Apache-2.0
  *
@@ -58,6 +58,17 @@
  *     rbl_link_send_collision() refuses more with RBL_ERR_TOO_BIG, and a datagram that claims more
  *     chunks is malformed.
  *
+ * AUTHENTICATION (contract revision 6, section 6.2)
+ *   - A host may have a token (cfg.token, or a generated one when cfg.endpoint_file is set); it then
+ *     answers a guest's hello that lacks the same token with bye "unauthorized" before any other check.
+ *     A guest sends cfg.token in its hello. The token is a secret: this library never puts it in an
+ *     event, an error, a bye or a log line, and wipes its own copy when the link is closed.
+ *   - cfg.endpoint_file: the host writes {"control_port":N,"token":"..."} there after it has bound its
+ *     port (atomically, owner-only) and removes it when the link is closed; the guest reads it before
+ *     every connection attempt. rbl_endpoint_write/read/remove are public for tools and tests.
+ *   - It keeps out other users and processes that cannot read the file; it does not protect against
+ *     processes of the same user. See the README and the contract's section 6.2.
+ *
  * See the README for a host and a guest example, and for how to embed this in a game plugin.
  */
 /* The implementation needs POSIX (clock_gettime, nanosleep, lstat, ftruncate, ...), which glibc hides
@@ -95,7 +106,7 @@ extern "C" {
 #define RBLDEF extern
 #endif
 
-#define REWRITE_LINK_VERSION "0.1.2"
+#define REWRITE_LINK_VERSION "0.2.0"
 
 /* ------------------------------------------------------------------------------------------
  * Constants and layouts (CONTRACT.md section 10)
@@ -116,6 +127,9 @@ extern "C" {
 #define RBL_TRIANGLE_LEN   36
 #define RBL_FRAME_LEN      24
 #define RBL_MAX_LINE       65536
+#define RBL_MAX_TOKEN      256   /* longest token, in bytes of UTF-8 (contract 6.2) */
+#define RBL_TOKEN_LEN      64    /* rbl_generate_token() writes this many hex digits */
+#define RBL_MAX_ENDPOINT_FILE 4096 /* longest endpoint file (contract 6.2) */
 #define RBL_MAX_PENDING_CONTROL (1 << 20)
 #define RBL_LINGER_MS      200
 #define RBL_MAX_ENTITIES   1024
@@ -341,7 +355,10 @@ typedef struct rbl_control {
     rbl_str unknown_type;                          /* RBL_CTL_UNKNOWN */
     union {
         struct { rbl_role role; rbl_str game; uint32_t protocol, min_protocol, udp_port, heartbeat_ms, timeout_ms;
-                 int has_session; uint32_t session; } hello;
+                 int has_session; uint32_t session;
+                 int has_token; rbl_str token; /* revision 6: the whole token as received, of any length (never cut at 256
+                                                  bytes: compare it with rbl_token_equal(), which says false above 256); absent or
+                                                  null on the wire is has_token = 0. A host's hello never has one. */ } hello;
         struct { uint32_t entity; rbl_str provider, asset, name; int has_name; } spawn;
         struct { uint32_t entity; } despawn;
         struct { rbl_role focus; rbl_str reason; int has_reason; } input;
@@ -361,6 +378,41 @@ RBLDEF int rbl_control_parse(char* line, size_t len, rbl_control* out, const cha
 RBLDEF int rbl_control_format(const rbl_control* c, char* out, size_t cap);
 
 /* ------------------------------------------------------------------------------------------
+ * Authentication (CONTRACT.md section 6.2, revision 6)
+ * ---------------------------------------------------------------------------------------- */
+
+/* Writes 32 bytes from the operating system's cryptographic generator as 64 lowercase hex digits plus
+ * a NUL into out (getrandom on Linux, arc4random_buf on macOS and the BSDs, BCryptGenRandom on
+ * Windows, /dev/urandom where nothing better exists). Returns RBL_OK, or RBL_ERR_IO with out[0] = 0
+ * if the generator failed: there is never a fallback to a weak source. */
+RBLDEF int rbl_generate_token(char out[65]);
+/* Compares two tokens (any bytes) in constant time as the contract's 6.2 describes: the XOR of both
+ * lengths and of 256 byte pairs (the shorter one padded with zeros) is ORed together, with no early
+ * exit, and the answer is 1 only if it is 0 and neither length is above 256. The time depends on
+ * neither the contents nor where they differ (it does not hide the lengths). Two empty tokens give 1;
+ * a handshake never asks, it refuses an empty token first. */
+RBLDEF int rbl_token_equal(const void* a, size_t alen, const void* b, size_t blen);
+/* Writes the endpoint file {"control_port":port,"token":"..."}\n atomically: a temporary file in the
+ * same directory (".<name>.<pid>.<random>.tmp"), created exclusively with mode 0600 from the start
+ * (Unix), written, flushed, closed and renamed over path (Windows: MoveFileExW with
+ * MOVEFILE_REPLACE_EXISTING). The directory is not created. The temporary file is removed on error.
+ * RBL_ERR_ARGS for port 0 or a token that is not 1..256 bytes of valid UTF-8, RBL_ERR_IO (see
+ * rbl_os_error) otherwise. Windows relies on the per-user ACL of the directory (contract 6.2). */
+RBLDEF int rbl_endpoint_write(const char* path, uint16_t port, const char* token);
+/* Reads and checks an endpoint file: path must name a regular file (checked before it is opened, so a
+ * FIFO cannot block; symbolic links are followed); on Unix a file whose mode has any group or other
+ * bit (mode & 077) is refused; at most 4096 bytes; one trailing "\n" or "\r\n" is dropped; the rest must
+ * be one JSON object under the control line rules (contract section 8) with control_port an integer
+ * 1..65535 and token a string of 1..256 bytes; other fields are ignored. token_out receives the token
+ * and a NUL (257 bytes). Returns RBL_OK; RBL_ERR_IO (missing or unreadable, rbl_os_error has the code);
+ * RBL_ERR_REFUSED (not a regular file, or permissions); RBL_ERR_MALFORMED (contents; also a file
+ * above 4096 bytes); RBL_ERR_ARGS. On failure *port is 0 and token_out is empty. The result never
+ * quotes the file. */
+RBLDEF int rbl_endpoint_read(const char* path, uint16_t* port, char token_out[257]);
+/* Deletes the file (ENOENT is not an error). Returns RBL_OK or RBL_ERR_IO. */
+RBLDEF int rbl_endpoint_remove(const char* path);
+
+/* ------------------------------------------------------------------------------------------
  * The link
  * ---------------------------------------------------------------------------------------- */
 
@@ -375,10 +427,19 @@ typedef struct rbl_config {
     uint32_t reconnect_ms;       /* guest: how often to retry connecting while no host answers */
     uint32_t max_collision_triangles; /* receiver limit on one assembled snapshot (a snapshot above it is dropped); default and
                                          maximum RBL_MAX_COLLISION_TRIANGLES (925696), 0 = the default, a larger value is clamped */
+    const char* token;           /* revision 6, optional (NULL). Host: the token a guest must send. Guest: the token it sends. 1 to
+                                    256 bytes of valid UTF-8; anything else makes rbl_link_host/guest fail with RBL_ERR_ARGS */
+    const char* endpoint_file;   /* revision 6, optional (NULL). Host: after the control port is bound, write this file with the
+                                    port and the token (generated if token is NULL), remove it when the link is closed; if the
+                                    write fails rbl_link_host fails. Guest: before every connection attempt read this file and use
+                                    its port and token instead of control_port and token; if it cannot be read, skip the attempt
+                                    and try again after reconnect_ms. Lifetime: the library copies token and endpoint_file when
+                                    the link is created, so these strings need not outlive rbl_link_host/guest(). */
 } rbl_config;
 
 /* Fills in the defaults: control port 47800, UDP port 0, heartbeat 250 ms, timeout 2000 ms,
- * reconnect 500 ms, 925696 triangles (4096 chunks, the contract's limit; you may lower it). */
+ * reconnect 500 ms, 925696 triangles (4096 chunks, the contract's limit; you may lower it), no token
+ * (token and endpoint_file are NULL). */
 RBLDEF void rbl_config_init(rbl_config* cfg, const char* game);
 
 typedef struct rbl_peer_info {
@@ -439,11 +500,14 @@ typedef struct rbl_stats {
     uint64_t dropped;        /* events or data dropped for lack of memory */
 } rbl_stats;
 
-/* Creates a host: listens on 127.0.0.1:control_port, binds the UDP socket. *out is NULL on
- * failure; rbl_strerror(result) says why, and rbl_os_error() has the OS error code. */
+/* Creates a host: listens on 127.0.0.1:control_port, binds the UDP socket, then (revision 6) writes
+ * the endpoint file if cfg->endpoint_file is set. *out is NULL on failure; rbl_strerror(result) says
+ * why, and rbl_os_error() has the OS error code. RBL_ERR_ARGS: a bad token (empty, above 256 bytes,
+ * not UTF-8) or an empty endpoint_file path. The error never carries the token. */
 RBLDEF int rbl_link_host(const rbl_config* cfg, rbl_link** out);
 /* Creates a guest: binds the UDP socket and connects to 127.0.0.1:control_port, retrying every
- * reconnect_ms until a host answers. */
+ * reconnect_ms until a host answers. With cfg->endpoint_file the port and token come from that file,
+ * read again before every attempt. */
 RBLDEF int rbl_link_guest(const rbl_config* cfg, rbl_link** out);
 /* The OS error code (errno or WSAGetLastError()) at the moment a failed create returned; call it
  * right after the failure, before any other call that could change errno. */
@@ -627,6 +691,22 @@ RBLDEF int rbl_path_is_absolute(const char* path, int windows_rules);
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+/* the OS random number generator for tokens (contract 6.2): getrandom on Linux (glibc 2.25+, musl), arc4random_buf on
+ * macOS and the BSDs, /dev/urandom if nothing else is there. Never a weak fallback: see rbli_random_strict. */
+#if defined(__linux__)
+#if defined(__has_include)
+#if __has_include(<sys/random.h>)
+#include <sys/random.h>
+#define RBLI_HAVE_GETRANDOM 1
+#endif
+#endif
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+#define RBLI_HAVE_ARC4RANDOM 1
+#if !defined(__APPLE__)
+/* strict POSIX feature macros can hide it on the BSDs; the signature is the same everywhere */
+extern void arc4random_buf(void*, size_t);
+#endif
+#endif
 #endif
 
 #if !defined(REWRITE_LINK_MALLOC) || !defined(REWRITE_LINK_REALLOC) || !defined(REWRITE_LINK_FREE)
@@ -708,6 +788,12 @@ RBLDEF int rbl_negotiate(int host_min, int host_max, int guest_min, int guest_ma
     return v >= lo ? v : -1;
 }
 
+/* Overwrites memory that held a secret; the volatile stops the compiler from dropping the stores. */
+static void rbli_wipe(void* p, size_t n) {
+    volatile unsigned char* v = (volatile unsigned char*)p;
+    while (n--) *v++ = 0;
+}
+
 /* Overflow-checked unsigned 64-bit arithmetic; each returns 1 on overflow. */
 static int rbli_add_u64(uint64_t a, uint64_t b, uint64_t* out) { *out = a + b; return *out < a; }
 static int rbli_mul_u64(uint64_t a, uint64_t b, uint64_t* out) {
@@ -753,8 +839,14 @@ static int rbli_net_up(void) { WSADATA d; return WSAStartup(MAKEWORD(2, 2), &d) 
 static void rbli_net_down(void) { WSACleanup(); }
 static void rbli_sock_close(rbli_sock s) { closesocket(s); }
 static int rbli_sock_nonblock(rbli_sock s) { u_long one = 1; return ioctlsocket(s, FIONBIO, &one) == 0 ? 0 : -1; }
+/* Fills out[0..n) from the OS generator; 0 on success, -1 if it failed (nothing is guessed). */
+static int rbli_random_strict(uint8_t* out, size_t n) {
+    return BCryptGenRandom(NULL, out, (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0 ? 0 : -1;
+}
+/* For things that need unpredictable-looking numbers but not secrecy (session numbers, file names): the same, and a
+ * simple generator if the OS one fails. Tokens use rbli_random_strict. */
 static void rbli_random(uint8_t* out, size_t n) {
-    if (BCryptGenRandom(NULL, out, (ULONG)n, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+    if (rbli_random_strict(out, n) != 0) {
         uint64_t t = rbl_now_us() ^ ((uint64_t)GetCurrentProcessId() << 32);
         size_t i;
         for (i = 0; i < n; i++) { t = t * 6364136223846793005ULL + 1442695040888963407ULL; out[i] = (uint8_t)(t >> 33); }
@@ -794,29 +886,50 @@ static int rbli_sock_nonblock(rbli_sock s) {
     if (fl < 0) return -1;
     return fcntl(s, F_SETFL, fl | O_NONBLOCK) == 0 ? 0 : -1;
 }
-static void rbli_random(uint8_t* out, size_t n) {
-#if defined(__APPLE__)
+/* Fills out[0..n) from the OS generator; 0 on success, -1 if it failed (nothing is guessed). */
+static int rbli_random_strict(uint8_t* out, size_t n) {
+#if defined(RBLI_HAVE_ARC4RANDOM)
     arc4random_buf(out, n);
+    return 0;
 #else
-    int fd = open("/dev/urandom", O_RDONLY
+    size_t got = 0;
+    int fd;
+#if defined(RBLI_HAVE_GETRANDOM)
+    while (got < n) {
+        ssize_t r = getrandom(out + got, n - got, 0);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            break; /* ENOSYS (an old kernel) or anything else: try /dev/urandom */
+        }
+        got += (size_t)r;
+    }
+    if (got == n) return 0;
+    got = 0;
+#endif
+    fd = open("/dev/urandom", O_RDONLY
 #ifdef O_CLOEXEC
-                  | O_CLOEXEC
+              | O_CLOEXEC
 #endif
     );
-    size_t got = 0;
-    if (fd >= 0) {
-        while (got < n) {
-            ssize_t r = read(fd, out + got, n - got);
-            if (r <= 0) break;
-            got += (size_t)r;
-        }
-        close(fd);
+    if (fd < 0) return -1;
+    while (got < n) {
+        ssize_t r = read(fd, out + got, n - got);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) break;
+        got += (size_t)r;
     }
-    if (got < n) {
-        uint64_t t = rbl_now_us() ^ ((uint64_t)getpid() << 32);
-        for (; got < n; got++) { t = t * 6364136223846793005ULL + 1442695040888963407ULL; out[got] = (uint8_t)(t >> 33); }
-    }
+    close(fd);
+    return got == n ? 0 : -1;
 #endif
+}
+/* For things that need unpredictable-looking numbers but not secrecy (session numbers, file names): the same, and a
+ * simple generator if the OS one fails. Tokens use rbli_random_strict. */
+static void rbli_random(uint8_t* out, size_t n) {
+    if (rbli_random_strict(out, n) != 0) {
+        size_t i;
+        uint64_t t = rbl_now_us() ^ ((uint64_t)getpid() << 32);
+        for (i = 0; i < n; i++) { t = t * 6364136223846793005ULL + 1442695040888963407ULL; out[i] = (uint8_t)(t >> 33); }
+    }
 }
 static unsigned rbli_pid(void) { return (unsigned)getpid(); }
 
@@ -1353,6 +1466,15 @@ static int rbli_utf8_valid(const uint8_t* s, size_t n) {
     return 1;
 }
 
+/* A configured token: NULL (none) or 1..256 bytes of valid UTF-8 (a C string cannot hold U+0000). */
+static int rbli_check_token(const char* t) {
+    size_t n;
+    if (!t) return RBL_OK;
+    n = strlen(t);
+    if (n < 1 || n > RBL_MAX_TOKEN || !rbli_utf8_valid((const uint8_t*)t, n)) return RBL_ERR_ARGS;
+    return RBL_OK;
+}
+
 /* ------------------------------------------------------------------------------------------
  * JSON: a strict reader for the control lines. It accepts exactly what serde_json accepts (the
  * Rust side): numbers follow the JSON grammar, -0 is a float, a number beyond the range of a
@@ -1661,13 +1783,13 @@ static int rbli_json_object(char* s, size_t n, const char* const* names, rbli_jf
 enum {
     RBLI_K_TYPE, RBLI_K_ROLE, RBLI_K_GAME, RBLI_K_PROTOCOL, RBLI_K_MIN_PROTOCOL, RBLI_K_UDP_PORT,
     RBLI_K_HEARTBEAT_MS, RBLI_K_TIMEOUT_MS, RBLI_K_SESSION, RBLI_K_ENTITY, RBLI_K_PROVIDER, RBLI_K_ASSET,
-    RBLI_K_NAME, RBLI_K_FOCUS, RBLI_K_REASON, RBLI_K_PATH, RBLI_K_WIDTH, RBLI_K_HEIGHT, RBLI_K_SLOTS,
+    RBLI_K_NAME, RBLI_K_FOCUS, RBLI_K_REASON, RBLI_K_PATH, RBLI_K_WIDTH, RBLI_K_HEIGHT, RBLI_K_SLOTS, RBLI_K_TOKEN,
     RBLI_K_COUNT
 };
 
 static const char* const rbli_key_names[RBLI_K_COUNT] = {
     "type", "role", "game", "protocol", "min_protocol", "udp_port", "heartbeat_ms", "timeout_ms", "session",
-    "entity", "provider", "asset", "name", "focus", "reason", "path", "width", "height", "slots"
+    "entity", "provider", "asset", "name", "focus", "reason", "path", "width", "height", "slots", "token"
 };
 
 static int rbli_str_is(const rbli_jf* f, const char* lit) {
@@ -1720,6 +1842,12 @@ RBLDEF int rbl_control_parse(char* line, size_t len, rbl_control* out, const cha
         if (f[RBLI_K_SESSION].kind != 0 && f[RBLI_K_SESSION].kind != 3) {
             if (rbli_need_uint(&f[RBLI_K_SESSION], RBLI_U32_MAX, &out->u.hello.session, why) != 0) return RBL_ERR_MALFORMED;
             out->u.hello.has_session = 1;
+        }
+        /* revision 6: `token` is an optional string of any length (the range is the handshake's business); the whole value
+         * is kept, pointing into the line; null is absent; any other type is an error like a wrong-typed optional field */
+        if (rbli_opt_str(&f[RBLI_K_TOKEN], &out->u.hello.token, &out->u.hello.has_token, why) != 0) {
+            *why = "bad control line: token";
+            return RBL_ERR_MALFORMED;
         }
     } else if (rbli_str_is(&f[RBLI_K_TYPE], "spawn")) {
         out->type = RBL_CTL_SPAWN;
@@ -1858,6 +1986,7 @@ static void rbli_format_control(rbli_out* o, const rbl_control* c) {
         rbli_out_key_u(o, "heartbeat_ms", c->u.hello.heartbeat_ms);
         rbli_out_key_u(o, "timeout_ms", c->u.hello.timeout_ms);
         if (c->u.hello.has_session) rbli_out_key_u(o, "session", c->u.hello.session);
+        if (c->u.hello.has_token) rbli_out_key_s(o, "token", c->u.hello.token);
         break;
     case RBL_CTL_SPAWN:
         rbli_out_lit(o, "{\"type\":\"spawn\"");
@@ -1906,6 +2035,43 @@ RBLDEF int rbl_control_format(const rbl_control* c, char* out, size_t cap) {
 }
 
 /* ------------------------------------------------------------------------------------------
+ * Authentication: the token (CONTRACT.md section 6.2)
+ * ---------------------------------------------------------------------------------------- */
+
+RBLDEF int rbl_generate_token(char out[65]) {
+    static const char hex[] = "0123456789abcdef";
+    uint8_t raw[32];
+    size_t i;
+    if (!out) return RBL_ERR_ARGS;
+    out[0] = 0;
+    if (rbli_random_strict(raw, sizeof raw) != 0) { rbli_wipe(raw, sizeof raw); return RBL_ERR_IO; }
+    for (i = 0; i < sizeof raw; i++) { out[2 * i] = hex[raw[i] >> 4]; out[2 * i + 1] = hex[raw[i] & 15]; }
+    out[2 * sizeof raw] = 0;
+    rbli_wipe(raw, sizeof raw);
+    return RBL_OK;
+}
+
+/* The contract's reference method. Both tokens are taken as if copied into 256 zero bytes: 256 byte pairs are XORed into one
+ * accumulator together with the XOR of the two lengths, and the loop never ends early. The accumulator is volatile, so the
+ * compiler cannot stop at the first difference. Only the lengths (not secret) decide which bytes are real and which are zeros. */
+RBLDEF int rbl_token_equal(const void* a, size_t alen, const void* b, size_t blen) {
+    const unsigned char* pa = (const unsigned char*)a;
+    const unsigned char* pb = (const unsigned char*)b;
+    volatile unsigned diff;
+    size_t i, lx = alen ^ blen;
+    unsigned k, lens = 0;
+    if ((alen && !pa) || (blen && !pb)) return 0;
+    for (k = 0; k < (unsigned)sizeof lx; k++) lens |= (unsigned)((lx >> (8u * k)) & 0xFFu);
+    diff = lens;
+    for (i = 0; i < RBL_MAX_TOKEN; i++) {
+        unsigned x = i < alen ? pa[i] : 0u;
+        unsigned y = i < blen ? pb[i] : 0u;
+        diff = diff | (x ^ y);
+    }
+    return diff == 0 && alen <= RBL_MAX_TOKEN && blen <= RBL_MAX_TOKEN;
+}
+
+/* ------------------------------------------------------------------------------------------
  * The link: control channel, closing connections, the arena, the entity table
  * ---------------------------------------------------------------------------------------- */
 
@@ -1949,8 +2115,14 @@ typedef enum rbli_state { RBLI_IDLE = 0, RBLI_CONNECTING, RBLI_HANDSHAKE, RBLI_L
 
 struct rbl_link {
     rbl_role role;
-    rbl_config cfg;
+    rbl_config cfg;      /* cfg.token and cfg.endpoint_file are NULL here: the copies below are the library's */
     char game[256];
+    char token[RBL_MAX_TOKEN + 1]; /* revision 6: host, the token it requires; guest, the token it sends (from cfg or the file) */
+    size_t token_len;
+    int has_token;
+    char* endpoint_path; /* a copy of cfg.endpoint_file, or NULL */
+    int endpoint_written; /* host: the file exists and is ours to remove */
+    uint16_t connect_port; /* guest: the port of the next attempt (cfg.control_port, or the endpoint file's) */
     uint32_t heartbeat_ms;
     rbli_sock udp, listener;
     uint16_t udp_port, control_port;
@@ -2389,6 +2561,11 @@ static void rbli_hello_for(rbl_link* l, rbl_control* m, uint32_t protocol, int h
     m->u.hello.timeout_ms = l->cfg.timeout_ms;
     m->u.hello.has_session = has_session;
     m->u.hello.session = session;
+    if (l->role == RBL_ROLE_GUEST && l->has_token) { /* only a guest's hello carries a token (contract 6.2) */
+        m->u.hello.has_token = 1;
+        m->u.hello.token.ptr = l->token;
+        m->u.hello.token.len = l->token_len;
+    }
 }
 
 /* ---- polling: connect ---- */
@@ -2416,7 +2593,21 @@ static void rbli_poll_connect(rbl_link* l, uint64_t now) {
         return;
     }
     if (l->state == RBLI_IDLE && now >= l->next_try) {
-        rbli_sock s = rbli_tcp_connect_start(l->cfg.control_port);
+        rbli_sock s;
+        if (l->endpoint_path) {
+            /* contract 6.2: the file is read before every attempt, since the host may have restarted with another port and
+             * token. If it cannot be read (the host is not running yet, the file is refused) there is no attempt and no event. */
+            uint16_t port = 0;
+            char tok[RBL_MAX_TOKEN + 1];
+            if (rbl_endpoint_read(l->endpoint_path, &port, tok) != RBL_OK) { l->next_try = now + l->cfg.reconnect_ms; return; }
+            l->connect_port = port;
+            l->control_port = port;
+            l->token_len = strlen(tok);
+            memcpy(l->token, tok, l->token_len + 1);
+            l->has_token = 1;
+            rbli_wipe(tok, sizeof tok);
+        }
+        s = rbli_tcp_connect_start(l->connect_port);
         if (s == RBLI_BAD_SOCK) { l->next_try = now + l->cfg.reconnect_ms; return; }
         l->connecting = s;
         l->state = RBLI_CONNECTING;
@@ -2448,6 +2639,16 @@ static int rbli_on_hello(rbl_link* l, const rbl_control* c, uint64_t now, char* 
     uint32_t protocol, session;
     uint64_t timeout;
     rbl_control reply;
+    /* contract 6.2: a host with a token checks it first, before role, version, ports or heartbeat, and answers with the fixed word
+     * only. A missing token, one outside 1..256 bytes and an unequal one are the same case. rbl_token_equal() compares in constant
+     * time and says no above 256 bytes, so a long token that begins with ours never matches. The reason holds no token. */
+    if (l->role == RBL_ROLE_HOST && l->has_token) {
+        const rbl_str* t = &c->u.hello.token;
+        if (!c->u.hello.has_token || t->len < 1 || t->len > RBL_MAX_TOKEN || !rbl_token_equal(t->ptr, t->len, l->token, l->token_len)) {
+            snprintf(reason, rcap, "unauthorized");
+            return 1;
+        }
+    }
     if (c->u.hello.role != expected) {
         snprintf(reason, rcap, "peer claims role %s", c->u.hello.role == RBL_ROLE_HOST ? "host" : "guest");
         return 1;
@@ -2843,8 +3044,15 @@ RBLDEF void rbl_config_init(rbl_config* cfg, const char* game) {
 
 RBLDEF int rbl_os_error(void) { return rbli_os_errno(); }
 
+/* Host: deletes the endpoint file it wrote (best effort, once). */
+static void rbli_endpoint_drop(rbl_link* l) {
+    if (l->endpoint_written && l->endpoint_path) rbl_endpoint_remove(l->endpoint_path);
+    l->endpoint_written = 0;
+}
+
 static void rbli_link_destroy(rbl_link* l) {
     int i;
+    rbli_endpoint_drop(l);
     if (l->connecting != RBLI_BAD_SOCK) rbli_sock_close(l->connecting);
     if (l->ctl.sock != RBLI_BAD_SOCK) rbli_sock_close(l->ctl.sock);
     rbli_ctl_free(&l->ctl);
@@ -2856,6 +3064,8 @@ static void rbli_link_destroy(rbl_link* l) {
     if (l->udp != RBLI_BAD_SOCK) rbli_sock_close(l->udp);
     if (l->listener != RBLI_BAD_SOCK) rbli_sock_close(l->listener);
     if (l->net_up) rbli_net_down();
+    if (l->endpoint_path) REWRITE_LINK_FREE(l->endpoint_path);
+    rbli_wipe(l->token, sizeof l->token);
     REWRITE_LINK_FREE(l);
 }
 
@@ -2865,11 +3075,15 @@ static int rbli_link_create(const rbl_config* cfg, rbl_role role, rbl_link** out
     if (!out) return RBL_ERR_ARGS;
     *out = NULL;
     if (!cfg) return RBL_ERR_ARGS;
+    if (rbli_check_token(cfg->token) != RBL_OK) return RBL_ERR_ARGS; /* the error says nothing about the token itself */
+    if (cfg->endpoint_file && !cfg->endpoint_file[0]) return RBL_ERR_ARGS;
     l = (rbl_link*)REWRITE_LINK_MALLOC(sizeof *l);
     if (!l) return RBL_ERR_NOMEM;
     memset(l, 0, sizeof *l);
     l->role = role;
     l->cfg = *cfg;
+    l->cfg.token = NULL;         /* the caller's strings need not outlive this call: what is needed is copied below */
+    l->cfg.endpoint_file = NULL;
     l->udp = l->listener = l->connecting = RBLI_BAD_SOCK;
     l->ctl.sock = RBLI_BAD_SOCK;
     l->state = RBLI_IDLE;
@@ -2882,6 +3096,18 @@ static int rbli_link_create(const rbl_config* cfg, rbl_role role, rbl_link** out
         rbli_copy_text(l->game, sizeof l->game, g, strlen(g));
         l->cfg.game = l->game;
     }
+    if (cfg->token) {
+        l->token_len = strlen(cfg->token);
+        memcpy(l->token, cfg->token, l->token_len + 1);
+        l->has_token = 1;
+    }
+    if (cfg->endpoint_file) {
+        size_t n = strlen(cfg->endpoint_file) + 1;
+        l->endpoint_path = (char*)REWRITE_LINK_MALLOC(n);
+        if (!l->endpoint_path) { rbli_link_destroy(l); return RBL_ERR_NOMEM; }
+        memcpy(l->endpoint_path, cfg->endpoint_file, n);
+    }
+    l->connect_port = cfg->control_port;
     if (l->cfg.heartbeat_ms == 0) l->cfg.heartbeat_ms = 250;
     if (l->cfg.timeout_ms == 0) l->cfg.timeout_ms = 2000;
     if (l->cfg.reconnect_ms == 0) l->cfg.reconnect_ms = 500;
@@ -2919,6 +3145,35 @@ static int rbli_link_create(const rbl_config* cfg, rbl_role role, rbl_link** out
         errno = saved;
 #endif
         return RBL_ERR_IO;
+    }
+    if (role == RBL_ROLE_HOST && l->endpoint_path) {
+        /* contract 6.2: only now, with the port bound, and with the port that was bound. A token that was not configured is made
+         * here, from the OS generator. If anything fails the host is not created (the listener is closed with it). */
+        int rc;
+        if (!l->has_token) {
+            char gen[RBL_TOKEN_LEN + 1];
+            rc = rbl_generate_token(gen);
+            if (rc == RBL_OK) {
+                l->token_len = strlen(gen);
+                memcpy(l->token, gen, l->token_len + 1);
+                l->has_token = 1;
+            }
+            rbli_wipe(gen, sizeof gen);
+        } else {
+            rc = RBL_OK;
+        }
+        if (rc == RBL_OK) rc = rbl_endpoint_write(l->endpoint_path, l->control_port, l->token);
+        if (rc != RBL_OK) {
+            saved = rbli_os_errno();
+            rbli_link_destroy(l);
+#if RBLI_WINDOWS
+            WSASetLastError(saved);
+#else
+            errno = saved;
+#endif
+            return rc;
+        }
+        l->endpoint_written = 1;
     }
     *out = l;
     return RBL_OK;
@@ -3087,6 +3342,7 @@ RBLDEF void rbl_link_close(rbl_link* l) {
     uint64_t now, stop;
     int i;
     if (!l) return;
+    rbli_endpoint_drop(l); /* first: from here on a guest must not be sent to a host that is closing */
     now = rbli_mono_ms();
     if (l->state == RBLI_CONNECTING && l->connecting != RBLI_BAD_SOCK) {
         rbli_sock_close(l->connecting);
@@ -3685,6 +3941,218 @@ RBLDEF void rbl_pixel_writer_close(rbl_pixel_writer* w) {
 #endif
     if (w->path) REWRITE_LINK_FREE(w->path);
     REWRITE_LINK_FREE(w);
+}
+
+/* ------------------------------------------------------------------------------------------
+ * Authentication: the endpoint file (CONTRACT.md section 6.2)
+ * ---------------------------------------------------------------------------------------- */
+
+/* The file's text: {"control_port":N,"token":"..."} and a newline, made with the library's own JSON string writer.
+ * Returns the length, or a negative status. A token needs at most 6 bytes per character when it is all control characters. */
+static int rbli_endpoint_text(char* out, size_t cap, uint16_t port, const char* token) {
+    rbli_out o;
+    o.buf = out; o.len = 0; o.cap = cap; o.growable = 0; o.fail = 0;
+    rbli_out_lit(&o, "{\"control_port\":");
+    rbli_out_u64(&o, port);
+    rbli_out_lit(&o, ",\"token\":");
+    rbli_out_json(&o, token, strlen(token));
+    rbli_out_lit(&o, "}\n");
+    return o.fail ? o.fail : (int)o.len;
+}
+
+/* ".<name>.<pid>.<random hex>.tmp" next to path, in a buffer to free. NULL: no name (path ends in a separator) or no memory. */
+static char* rbli_endpoint_tmp_path(const char* path) {
+    const char* base = path;
+    const char* q;
+    uint8_t r[8];
+    char hex[17];
+    size_t dir, need, i;
+    char* tmp;
+    for (q = path; *q; q++) {
+#if RBLI_WINDOWS
+        if (*q == '/' || *q == '\\' || *q == ':') base = q + 1;
+#else
+        if (*q == '/') base = q + 1;
+#endif
+    }
+    if (!*base) return NULL;
+    dir = (size_t)(base - path);
+    rbli_random(r, sizeof r);
+    for (i = 0; i < sizeof r; i++) { hex[2 * i] = "0123456789abcdef"[r[i] >> 4]; hex[2 * i + 1] = "0123456789abcdef"[r[i] & 15]; }
+    hex[16] = 0;
+    need = dir + 1 + strlen(base) + 1 + 20 + 1 + 16 + 4 + 1;
+    tmp = (char*)REWRITE_LINK_MALLOC(need);
+    if (!tmp) return NULL;
+    memcpy(tmp, path, dir);
+    snprintf(tmp + dir, need - dir, ".%s.%u.%s.tmp", base, rbli_pid(), hex);
+    return tmp;
+}
+
+RBLDEF int rbl_endpoint_write(const char* path, uint16_t port, const char* token) {
+    char text[2048];
+    char* tmp;
+    int len, rc = RBL_ERR_IO;
+    if (!path || !path[0] || !token || port == 0 || rbli_check_token(token) != RBL_OK || !token[0]) return RBL_ERR_ARGS;
+    len = rbli_endpoint_text(text, sizeof text, port, token);
+    if (len < 0) { rbli_wipe(text, sizeof text); return len == RBL_ERR_NOMEM ? RBL_ERR_NOMEM : RBL_ERR_ARGS; }
+    tmp = rbli_endpoint_tmp_path(path);
+    if (!tmp) { rbli_wipe(text, sizeof text); return RBL_ERR_ARGS; }
+#if RBLI_WINDOWS
+    {
+        wchar_t* wtmp = rbli_widen(tmp);
+        wchar_t* wpath = rbli_widen(path);
+        HANDLE h = INVALID_HANDLE_VALUE;
+        int ok = 0;
+        if (wtmp && wpath) {
+            /* CREATE_NEW: fails if the name exists. No mode bits on Windows: the directory's per-user ACL keeps others out. */
+            h = CreateFileW(wtmp, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (h != INVALID_HANDLE_VALUE) {
+                size_t off = 0;
+                ok = 1;
+                while (ok && off < (size_t)len) {
+                    DWORD w = 0;
+                    if (!WriteFile(h, text + off, (DWORD)((size_t)len - off), &w, NULL) || w == 0) ok = 0;
+                    else off += w;
+                }
+                if (ok && !FlushFileBuffers(h)) ok = 0;
+                if (!CloseHandle(h)) ok = 0;
+                if (ok && !MoveFileExW(wtmp, wpath, MOVEFILE_REPLACE_EXISTING)) ok = 0;
+                if (!ok) { WSASetLastError((int)GetLastError()); DeleteFileW(wtmp); }
+            } else {
+                WSASetLastError((int)GetLastError());
+            }
+        } else if (!wtmp || !wpath) {
+            rc = RBL_ERR_ARGS; /* not UTF-8, or no memory */
+        }
+        if (wtmp) REWRITE_LINK_FREE(wtmp);
+        if (wpath) REWRITE_LINK_FREE(wpath);
+        if (ok) rc = RBL_OK;
+    }
+#else
+    {
+        int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL
+#ifdef O_CLOEXEC
+                      | O_CLOEXEC
+#endif
+                      , 0600); /* owner only from the moment it exists: never a chmod after the data is in */
+        if (fd >= 0) {
+            size_t off = 0;
+            int ok = 1, e = 0;
+            while (ok && off < (size_t)len) {
+                ssize_t w = write(fd, text + off, (size_t)len - off);
+                if (w < 0 && errno == EINTR) continue;
+                if (w <= 0) { ok = 0; e = errno; } else off += (size_t)w;
+            }
+            if (ok && fsync(fd) != 0 && errno != EINVAL && errno != ENOTSUP && errno != ENOSYS) { ok = 0; e = errno; }
+            if (close(fd) != 0 && ok) { ok = 0; e = errno; }
+            if (ok && rename(tmp, path) != 0) { ok = 0; e = errno; }
+            if (ok) rc = RBL_OK;
+            else { unlink(tmp); errno = e; }
+        }
+    }
+#endif
+    rbli_wipe(text, sizeof text);
+    REWRITE_LINK_FREE(tmp);
+    return rc;
+}
+
+RBLDEF int rbl_endpoint_read(const char* path, uint16_t* port, char token_out[257]) {
+    char buf[RBL_MAX_ENDPOINT_FILE + 2];
+    size_t n = 0;
+    rbli_jf f[2];
+    static const char* const names[2] = { "control_port", "token" };
+    const char* why = NULL;
+    int rc = RBL_ERR_MALFORMED;
+    if (port) *port = 0;
+    if (token_out) token_out[0] = 0;
+    if (!path || !path[0] || !port || !token_out) return RBL_ERR_ARGS;
+    /* 1. the path names a regular file, and that is known before it is opened (a FIFO would block the open) */
+#if RBLI_WINDOWS
+    {
+        wchar_t* wp = rbli_widen(path);
+        DWORD attr;
+        HANDLE h;
+        if (!wp) return RBL_ERR_ARGS;
+        attr = GetFileAttributesW(wp);
+        if (attr == INVALID_FILE_ATTRIBUTES) { WSASetLastError((int)GetLastError()); REWRITE_LINK_FREE(wp); return RBL_ERR_IO; }
+        if (attr & FILE_ATTRIBUTE_DIRECTORY) { REWRITE_LINK_FREE(wp); return RBL_ERR_REFUSED; }
+        h = CreateFileW(wp, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                        FILE_ATTRIBUTE_NORMAL, NULL);
+        REWRITE_LINK_FREE(wp);
+        if (h == INVALID_HANDLE_VALUE) { WSASetLastError((int)GetLastError()); return RBL_ERR_IO; }
+        if (GetFileType(h) != FILE_TYPE_DISK) { CloseHandle(h); return RBL_ERR_REFUSED; }
+        while (n < RBL_MAX_ENDPOINT_FILE + 1) {
+            DWORD got = 0;
+            if (!ReadFile(h, buf + n, (DWORD)(RBL_MAX_ENDPOINT_FILE + 1 - n), &got, NULL)) {
+                WSASetLastError((int)GetLastError()); CloseHandle(h); rbli_wipe(buf, sizeof buf); return RBL_ERR_IO;
+            }
+            if (got == 0) break;
+            n += got;
+        }
+        CloseHandle(h);
+    }
+#else
+    {
+        struct stat st;
+        int fd;
+        if (stat(path, &st) != 0) return RBL_ERR_IO; /* no file: the host is not running (yet) */
+        if (!S_ISREG(st.st_mode)) return RBL_ERR_REFUSED;
+        if (st.st_mode & 077) return RBL_ERR_REFUSED; /* group or others could read it, so someone else could have written it */
+        fd = open(path, O_RDONLY | O_NONBLOCK
+#ifdef O_CLOEXEC
+                  | O_CLOEXEC
+#endif
+        );
+        if (fd < 0) return RBL_ERR_IO;
+        /* decided again on the open file: the path may have been swapped since the stat */
+        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || (st.st_mode & 077)) { close(fd); return RBL_ERR_REFUSED; }
+        while (n < RBL_MAX_ENDPOINT_FILE + 1) {
+            ssize_t r = read(fd, buf + n, RBL_MAX_ENDPOINT_FILE + 1 - n);
+            if (r < 0 && errno == EINTR) continue;
+            if (r < 0) { int e = errno; close(fd); rbli_wipe(buf, sizeof buf); errno = e; return RBL_ERR_IO; }
+            if (r == 0) break;
+            n += (size_t)r;
+        }
+        close(fd);
+    }
+#endif
+    /* 2. the contents: at most 4096 bytes (the newline counts), one trailing newline is the framing of a control line, the rest
+     * is one JSON object under the control line rules (valid UTF-8, no byte order mark, strict syntax, no NUL escape) */
+    if (n <= RBL_MAX_ENDPOINT_FILE) {
+        if (n > 0 && buf[n - 1] == '\n') { n--; if (n > 0 && buf[n - 1] == '\r') n--; }
+        buf[n] = 0;
+        if (memchr(buf, '\n', n) == NULL && rbli_utf8_valid((const uint8_t*)buf, n) &&
+            rbli_json_object(buf, n, names, f, 2, &why) == 0 &&
+            f[0].kind == 2 && f[0].u >= 1 && f[0].u <= 65535 &&
+            f[1].kind == 1 && f[1].slen >= 1 && f[1].slen <= RBL_MAX_TOKEN) {
+            *port = (uint16_t)f[0].u;
+            memcpy(token_out, f[1].s, f[1].slen);
+            token_out[f[1].slen] = 0;
+            rc = RBL_OK;
+        }
+    }
+    rbli_wipe(buf, sizeof buf);
+    return rc;
+}
+
+RBLDEF int rbl_endpoint_remove(const char* path) {
+    if (!path || !path[0]) return RBL_ERR_ARGS;
+#if RBLI_WINDOWS
+    {
+        wchar_t* wp = rbli_widen(path);
+        DWORD e;
+        if (!wp) return RBL_ERR_ARGS;
+        if (DeleteFileW(wp)) { REWRITE_LINK_FREE(wp); return RBL_OK; }
+        e = GetLastError();
+        REWRITE_LINK_FREE(wp);
+        if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) return RBL_OK;
+        WSASetLastError((int)e);
+        return RBL_ERR_IO;
+    }
+#else
+    if (unlink(path) == 0 || errno == ENOENT) return RBL_OK;
+    return RBL_ERR_IO;
+#endif
 }
 
 #ifdef __cplusplus
