@@ -6,6 +6,7 @@
 #   make build/interop_peer   the program the cross-language interop matrix of rewrite-bridge runs (tests/interop/)
 #   make cxx        compile the implementation as C++11 and use the API from C++
 #   make interop    run tests/interop.sh (set RBL_FAKE_HOST, RBL_FAKE_GUEST, RBL_JAVA_CP for the other peers)
+#   make fuzz       build the libFuzzer harnesses of fuzz/ (not part of `make`; needs clang with the libFuzzer runtime; see fuzz/README.md)
 #   make clean
 
 CC      ?= cc
@@ -64,7 +65,10 @@ cxx: $(BUILD)/cxx_check
 interop: $(BUILD)/demo
 	RBL_DEMO=$(BUILD)/demo tests/interop.sh
 
+fuzz:
+	$(MAKE) -C fuzz all
+
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all test asan cxx interop clean
+.PHONY: all test asan cxx interop fuzz clean
