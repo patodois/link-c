@@ -500,6 +500,53 @@ TEST(json_matches_serde_json) {
     }
 }
 
+/* Found by fuzzing (fuzz/check_corpus.py): the reader rejected numbers between 1.7976931348623158e308 and the halfway point
+ * 2^1024 - 2^970, which round to the largest finite double. A number is out of range exactly when it rounds to infinity:
+ * IEEE 754-2019 section 4.3.1, roundTiesToEven, so at or above that halfway point (a tie goes to the even 2^1024). */
+TEST(a_number_is_out_of_range_exactly_when_it_rounds_to_infinity) {
+    /* 2^1024 - 2^970, 309 digits; its last digit is 2, so "...91" is the largest 309 digit number below it and "...93" the next above */
+    static const char L[] =
+        "179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887"
+        "910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819"
+        "860834936475292719074168444365510704342711559699508093042880177904174497792";
+    char doc[1024];
+    size_t n = sizeof L - 1;
+    static const char* const finite[] = { "1.7976931348623157e308", "1.7976931348623158e308", "1.79769313486231580793e308", "1.797693134862315807937e308",
+                                          "0.1797693134862315807937e309", "17976931348623158079e289", "1e308", "9e307", "0e999", "1e-999" };
+    static const char* const infinite[] = { "1.7976931348623159e308", "1.8e308", "2e308", "1e309", "0.19e309", "18e307", "1e999", "10000e305" };
+    size_t i;
+    for (i = 0; i < sizeof finite / sizeof finite[0]; i++) {
+        if (!json_accepts(finite[i])) { snprintf(doc, sizeof doc, "%s is a finite double and must be accepted", finite[i]); t_fail(__FILE__, __LINE__, doc); }
+    }
+    for (i = 0; i < sizeof infinite / sizeof infinite[0]; i++) {
+        if (json_accepts(infinite[i])) { snprintf(doc, sizeof doc, "%s rounds to infinity and must be refused", infinite[i]); t_fail(__FILE__, __LINE__, doc); }
+    }
+    /* the halfway point itself, one below, one above, in several spellings */
+    memcpy(doc, L, n); doc[n] = 0;
+    CHECK(!json_accepts(doc));                                   /* the tie rounds to even: 2^1024, infinity */
+    doc[n - 1] = '1';
+    CHECK(json_accepts(doc));                                    /* one below: rounds down to the largest finite double */
+    doc[n - 1] = '3';
+    CHECK(!json_accepts(doc));                                   /* one above */
+    memcpy(doc, L, n); strcpy(doc + n, ".0");
+    CHECK(!json_accepts(doc));                                   /* the same value with a fraction */
+    memcpy(doc, L, n); doc[n - 1] = '1'; strcpy(doc + n, ".999999");
+    CHECK(json_accepts(doc));
+    memcpy(doc, L, n); doc[n] = '0'; doc[n + 1] = 0;
+    CHECK(!json_accepts(doc));                                   /* a 310 digit integer is ten times larger: above */
+    {   /* as the exponent form of the same digits */
+        char d2[1024];
+        d2[0] = L[0]; d2[1] = '.'; memcpy(d2 + 2, L + 1, n - 1); strcpy(d2 + 1 + n, "e308");
+        CHECK(!json_accepts(d2));
+        d2[n] = '1';                                             /* last digit 2 -> 1 */
+        CHECK(json_accepts(d2));
+        memcpy(d2 + 2, L + 1, n - 1); strcpy(d2 + 1 + n, "0e308");   /* a trailing zero changes nothing */
+        CHECK(!json_accepts(d2));
+        memcpy(d2 + 2, L + 1, n - 1); strcpy(d2 + 1 + n, "1e308");   /* a nonzero digit after the whole limit is above it */
+        CHECK(!json_accepts(d2));
+    }
+}
+
 static char g_pbuf[2][131072];
 static int g_pi;
 
@@ -2157,11 +2204,15 @@ static int ep_dir(char* dir, size_t cap, int n) {
 #endif
 }
 static void ep_path(char* out, size_t cap, const char* dir, const char* name) {
+    /* dir may be the same buffer as out (ep_path(deep, sizeof deep, deep, ...)): snprintf with an argument that overlaps its
+     * destination is undefined (C99 7.19.6.5), and glibc 2.39 then writes a different path, so build it in a copy */
+    char tmp[1400];
 #if RBLI_WINDOWS
-    snprintf(out, cap, "%s\\%s", dir, name);
+    snprintf(tmp, sizeof tmp, "%s\\%s", dir, name);
 #else
-    snprintf(out, cap, "%s/%s", dir, name);
+    snprintf(tmp, sizeof tmp, "%s/%s", dir, name);
 #endif
+    snprintf(out, cap, "%s", tmp);
 }
 static int ep_count_entries(const char* dir) {
     int n = 0;
@@ -2564,6 +2615,7 @@ int main(void) {
     RUN(serial_arithmetic_and_negotiation);
     RUN(camera_helpers_and_quaternions);
     RUN(json_matches_serde_json);
+    RUN(a_number_is_out_of_range_exactly_when_it_rounds_to_infinity);
     RUN(control_contract_examples_parse);
     RUN(control_broken_lines_are_protocol_errors);
     RUN(control_lines_round_trip);

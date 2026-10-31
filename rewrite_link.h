@@ -1544,18 +1544,14 @@ static int rbli_jnumber(rbli_jp* p, rbli_jf* cap) {
         size_t k, lead_zero = 0, sig_int;
         long dexp;
         int have_sig = 0;
-        char first[17];
-        size_t nfirst = 0;
         /* significant digits: integer part without leading zeros, then the fraction */
         sig_int = 0;
         for (k = int_start; k < int_end; k++) {
             if (!have_sig && p->s[k] == '0') continue;
             have_sig = 1;
-            if (nfirst < 17) first[nfirst++] = p->s[k];
             sig_int++;
         }
         if (have_sig) {
-            for (k = frac_start; k < frac_end && nfirst < 17; k++) first[nfirst++] = p->s[k];
             dexp = (long)sig_int - 1 + exp10;
         } else {
             for (k = frac_start; k < frac_end; k++) {
@@ -1564,7 +1560,6 @@ static int rbli_jnumber(rbli_jp* p, rbli_jf* cap) {
                 break;
             }
             if (have_sig) {
-                for (; k < frac_end && nfirst < 17; k++) first[nfirst++] = p->s[k];
                 dexp = -(long)(lead_zero + 1) + exp10;
             } else {
                 dexp = -100000;
@@ -1573,11 +1568,34 @@ static int rbli_jnumber(rbli_jp* p, rbli_jf* cap) {
         if (have_sig) {
             if (dexp > 308) return rbli_jfail(p, "number out of range");
             if (dexp == 308) {
-                static const char max17[] = "17976931348623158";
-                char pad[17];
-                size_t m;
-                for (m = 0; m < 17; m++) pad[m] = m < nfirst ? first[m] : '0';
-                if (memcmp(pad, max17, 17) >= 0) return rbli_jfail(p, "number out of range");
+                /* IEEE 754-2019 section 4.3.1 (roundTiesToEven): a decimal rounds to infinity exactly when it is at least halfway
+                 * between the largest finite binary64, (2^53 - 1) * 2^971, and 2^1024, i.e. at least 2^1024 - 2^970. Its 309 digits: */
+                static const char limit[] =
+                    "179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692887"
+                    "910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842914819"
+                    "860834936475292719074168444365510704342711559699508093042880177904174497792";
+                const size_t nlimit = sizeof limit - 1;
+                size_t m = 0, ki = int_start, kf = frac_start;
+                int started = 0, below = 0;
+                for (;;) {
+                    char dg;
+                    if (ki < int_end) dg = p->s[ki++];
+                    else if (kf < frac_end) dg = p->s[kf++];
+                    else break;
+                    if (!started) {
+                        if (dg == '0') continue;
+                        started = 1;
+                    }
+                    if (m < nlimit) {
+                        if (dg < limit[m]) { below = 1; break; }
+                        if (dg > limit[m]) return rbli_jfail(p, "number out of range");
+                        m++;
+                    } else if (dg != '0') {
+                        return rbli_jfail(p, "number out of range"); /* more digits after the whole limit: above it */
+                    }
+                }
+                /* digits that ran out before the limit's did compare as zeros against its last digit (2): below; all of them equal: the limit itself */
+                if (!below && m >= nlimit) return rbli_jfail(p, "number out of range");
             }
         }
     }
