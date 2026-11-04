@@ -7,6 +7,8 @@ The protocol is defined by `docs/CONTRACT.md` in the rewrite-bridge repository; 
 implementation of it. The Rust crate, [link-java](https://github.com/patodois/link-java) and this library
 are the implementations that exist so far, and they talk to each other (see "Interop").
 
+**Adding this to a game.** Read the [guide to adding a game](https://github.com/patodois/rewrite-bridge/blob/main/docs/INTEGRATING.md) first: it says whether to build a host or a guest, and has a host loop and a guest loop that compile against `rewrite_link.h` and were run against rewrite-bridge's `fake_host` and `fake_guest`. This library has not been run inside SKSE, F4SE, ScriptHookV or Unreal; the guide lists what is untested.
+
 - One file, `rewrite_link.h`, in the style of the stb libraries: `#define REWRITE_LINK_IMPLEMENTATION` in
   exactly one `.c` or `.cpp` file, plain `#include` everywhere else.
 - C99, and it compiles as C++ (`extern "C"`). Nothing but the C library and the platform: POSIX sockets and
