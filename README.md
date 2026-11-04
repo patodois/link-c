@@ -4,8 +4,8 @@ A single-header **C99** implementation of the **rewrite-bridge passthrough link 
 revision 6), so that a game mod written in C or C++ (an SKSE or F4SE plugin, a ScriptHookV script, an Unreal
 or other native plugin) can be a **host** or a **guest** next to any other game or rewrite that speaks it.
 The protocol is defined by `docs/CONTRACT.md` in the rewrite-bridge repository; this library is one
-implementation of it. The Rust crate, [link-java](https://github.com/patodois/link-java) and this library
-are the implementations that exist so far, and they talk to each other (see "Interop").
+implementation of it. The Rust crate, [link-java](https://github.com/patodois/link-java), [link-cs](https://github.com/patodois/link-cs)
+and this library are the four implementations, and they talk to each other (see "Interop").
 
 **Adding this to a game.** Read the [guide to adding a game](https://github.com/patodois/rewrite-bridge/blob/main/docs/INTEGRATING.md) first: it says whether to build a host or a guest, and has a host loop and a guest loop that compile against `rewrite_link.h` and were run against rewrite-bridge's `fake_host` and `fake_guest`. This library has not been run inside SKSE, F4SE, ScriptHookV or Unreal; the guide lists what is untested.
 
@@ -298,8 +298,8 @@ tests/interop.sh
 
 - Developed and tested on macOS (arm64, clang). The Windows code (Winsock, `MapViewOfFile`, the MSVC atomics) was
   written against the documentation and syntax-checked against stand-in headers, **not compiled with MSVC or run
-  on Windows**; the CI workflow builds and tests it there, but this repository has not been pushed, so it has not
-  run yet. GCC on Linux has not been tried either. The revision 6 Windows code (`BCryptGenRandom`, `CreateFileW` with
+  on Windows**; the CI workflow builds and tests it there, but its results are not recorded here, so treat the Windows code as
+  unverified. GCC on Linux has not been tried either. The revision 6 Windows code (`BCryptGenRandom`, `CreateFileW` with
   `CREATE_NEW`, `MoveFileExW`, `GetFileType`) is equally untested; `bcrypt` is linked by the CMake target and by the
   `#pragma comment` for MSVC.
 - Winsock: each link calls `WSAStartup` and, when it is closed, `WSACleanup`; Windows counts them. If your own code uses sockets, hold your own `WSAStartup`
