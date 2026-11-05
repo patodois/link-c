@@ -106,7 +106,7 @@ extern "C" {
 #define RBLDEF extern
 #endif
 
-#define REWRITE_LINK_VERSION "0.2.0"
+#define REWRITE_LINK_VERSION "0.3.0"
 
 /* ------------------------------------------------------------------------------------------
  * Constants and layouts (CONTRACT.md section 10)
