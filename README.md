@@ -1,7 +1,7 @@
 # link-c
 
 A single-header **C99** implementation of the **rewrite-bridge passthrough link protocol v1** (contract
-revision 6), so that a game mod written in C or C++ (an SKSE or F4SE plugin, a ScriptHookV script, an Unreal
+revision 7), so that a game mod written in C or C++ (an SKSE or F4SE plugin, a ScriptHookV script, an Unreal
 or other native plugin) can be a **host** or a **guest** next to any other game or rewrite that speaks it.
 The protocol is defined by `docs/CONTRACT.md` in the rewrite-bridge repository; this library is one
 implementation of it. The Rust crate, [link-java](https://github.com/patodois/link-java), [link-cs](https://github.com/patodois/link-cs)
@@ -12,7 +12,7 @@ and this library are the four implementations, and they talk to each other (see 
 - One file, `rewrite_link.h`, in the style of the stb libraries: `#define REWRITE_LINK_IMPLEMENTATION` in
   exactly one `.c` or `.cpp` file, plain `#include` everywhere else.
 - C99, and it compiles as C++ (`extern "C"`). Nothing but the C library and the platform: POSIX sockets and
-  `mmap` on macOS and Linux, Winsock and `MapViewOfFile` on Windows. No threads are created.
+  `pread`/`preadv` for Unix readers and `mmap` for writers, Winsock and `MapViewOfFile` on Windows. No threads are created.
 - Everything binds and connects to `127.0.0.1` only.
 - No global state. The few allocations are listed at the top of the header; `REWRITE_LINK_MALLOC`,
   `REWRITE_LINK_REALLOC` and `REWRITE_LINK_FREE` replace the allocator.
@@ -21,6 +21,20 @@ and this library are the four implementations, and they talk to each other (see 
 The functions are prefixed `rbl_` (the prefix the contract uses for its C layouts in section 10, which this
 header defines with the same names: `rbl_header`, `rbl_camera`, `rbl_pose`, ...), so they do not collide with
 anything in a large plugin project.
+
+### Migrating pixel consumers to 0.3.0
+
+`RBL_EV_FRAME` is an unvalidated announcement. `Link` no longer filters its number before
+checking a slot. Present frames with `rbl_pixel_reader_read_latest`; the raw `read_frame`
+and `read` APIs remain available for inspection and re-reading. Passing `NULL` for depth
+omits that plane. Only a successful copy advances order; reader stats include `stale`.
+Output buffers are valid only after `RBL_OK`, and may contain partial or old bytes on failure.
+On a new frame channel, session loss, or `RBL_MISS_GONE`, close the old reader and clear the
+cached image, even if the replacement cannot be opened. Discard asynchronous results from
+replaced readers. A null frame pointer returns `RBL_ERR_ARGS` without changing counters.
+This minor version is intentionally incompatible with old presentation consumers despite
+unchanged source signatures. See [PIXEL-IO.md](PIXEL-IO.md).
+
 
 ## A host in 20 lines
 
@@ -87,7 +101,7 @@ standing in for the game's frame loop. `examples/demo.c` is the longer one, the 
 | `rbl_link_disconnect(link, reason)`, `rbl_link_close(link)` | `bye`, half-close, drain (CONTRACT 6.1). `disconnect` does not block; `close` may block for up to about 250 ms, so call it at shutdown. |
 | `rbl_link_is_connected`, `rbl_link_peer`, `rbl_link_focus`, `rbl_link_stats`, `rbl_link_control_port`, `rbl_link_udp_port` | Queries. `rbl_stats` has `malformed`, `stale`, `foreign`, `unknown_entity`, `spawn_ignored`, `send_dropped`, `datagrams_sent/received`, `lines_sent/received`, `dropped`. |
 | `rbl_pixel_writer_create[_temp]`, `rbl_pixel_writer_write`, `rbl_link_announce_writer`, `rbl_pixel_writer_close` | The sending side of the pixel file: created exclusively, colour and optional linear depth, seqlock. |
-| `rbl_pixel_reader_open`, `rbl_pixel_reader_read_frame` (`rbl_pixel_reader_read`), `rbl_pixel_reader_close` | The receiving side: every revision 5 check, copies a slot into your buffers with the seqlock. |
+| `rbl_pixel_reader_open`, `rbl_pixel_reader_read_latest` (raw `read_frame` / `read`), `rbl_pixel_reader_close` | The receiving side: every revision 5 check, copies a slot into your buffers with the seqlock. |
 | `rbl_wire_*`, `rbl_control_parse`, `rbl_control_format` | The codecs, public for tools and tests. |
 | `cfg.token`, `cfg.endpoint_file`, `rbl_generate_token`, `rbl_token_equal`, `rbl_endpoint_write`, `rbl_endpoint_read`, `rbl_endpoint_remove` | Authentication, contract revision 6 (below). |
 | `rbl_camera_look_at`, `rbl_pose_identity`, `rbl_quat_*` | Small helpers in the link's conventions (right-handed, +Y up, +Z front). |
@@ -107,16 +121,16 @@ keep. If more is waiting than your array holds, the rest waits in the socket buf
 A guest renders, reads the image back, `rbl_pixel_writer_write()`s it (RGBA8 and, if the file was created with
 depth, linear view depth in metres) and then sends the `Frame` datagram with `rbl_link_send_frame()`. A host
 that gets `RBL_EV_FRAME_CHANNEL` opens the path with `rbl_pixel_reader_open()` and, on every `RBL_EV_FRAME`,
-calls `rbl_pixel_reader_read_frame()` with the `rbl_frame` of the event. The reader skips the frame (before it
+calls `rbl_pixel_reader_read_latest()` with the `rbl_frame` of the event. The reader skips the frame (before it
 copies a pixel) when the datagram's width or height is 0 or above the file's, or when the slot header's is 0, above
 the file's or not the datagram's; it does not require `slot == frame % slots`. (`rbl_pixel_reader_read()`, with only
 the frame number and the slot, is kept so that existing programs still build; it cannot compare the datagram's size,
 checks the slot header's against the file's alone and is **not conformant** to contract section 9.6. Frame 0 is always skipped.) The reader returns
 `RBL_MISS_BUSY`, `OTHER_FRAME` or `OVERWRITTEN` when the writer got there first (skip the frame), and
-`RBL_MISS_GONE` when the file shrank under the mapping (drop the reader). Reprojection and compositing with
+`RBL_MISS_GONE` when the file shrank or positional I/O failed (drop the reader and cached image). Reprojection and compositing with
 depth (CONTRACT 9.7) are the host engine's job; this library does not do them.
 
-## Authentication: the token and the endpoint file (contract revision 6)
+## Authentication: the token and the endpoint file (contract revision 7)
 
 A host may require a token; a guest then has to send it in its `hello`. Without one, nothing changes. Two new
 optional fields of `rbl_config` (both `NULL` after `rbl_config_init`):
@@ -169,7 +183,7 @@ deliberately broken copies of the header to check that they notice):
 - `heartbeat_ms` 10 to 10000: out of range in a `hello` is a handshake error, in your own config it is clamped;
 - the pixel file reader: an absolute path to a regular file (not a symlink, FIFO, device or directory; checked
   before and after opening with `O_NONBLOCK`, same device and inode), width and height at most 16384, at most 2^26
-  pixels, `stride == width * 4`, checked 64-bit arithmetic for every size, a length check against the mapping
+  pixels, `stride == width * 4`, checked 64-bit arithmetic for every size, a length check before reading, plus bounded positional I/O on Unix (revision 7)
   **before every read**; the writer: created with `O_CREAT | O_EXCL` (`CREATE_NEW`), never resized or truncated,
   the same limits, deleted at the end;
 - the control channel reads lines of at most 65536 bytes, strict UTF-8, and a JSON reader that accepts what Rust's
@@ -311,12 +325,3 @@ tests/interop.sh
   depth floats but has not been run.
 - Strings that you pass in must be UTF-8 (invalid sequences are replaced by U+FFFD). `game` is cut at 255 bytes,
   a peer's game name at 127.
-
-### Ordem de apresentação de pixels
-
-Os eventos Frame são anúncios ainda não validados. Ao trocar frame_channel ou perder a sessão,
-limpe a imagem anterior e descarte o leitor anterior, inclusive se o novo arquivo não abrir.
-Use a leitura de apresentação read_latest (Rust/C), ReadLatest (C#) ou readLatest (Java):
-só uma cópia válida avança o maior número do arquivo atual. As leituras brutas continuam
-permitindo releituras e não implementam ordem de apresentação. Consumidores assíncronos devem
-associar trabalhos e resultados à instância do leitor e rejeitar resultados de leitores substituídos.
