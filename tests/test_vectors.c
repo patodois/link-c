@@ -55,7 +55,7 @@
  *     scripts/sync-link-vectors.sh <path of this repository>
  * (it copies the directory and prints "VECTORS_DIGEST = <hex>"), paste the hex here, then run `make test`
  * and re-check KNOWN_DISAGREEMENTS. */
-#define VECTORS_DIGEST "e0de8c0cc9146c1351e56047a14e80128717a56944f7e0a5b2f6189d8de88b6a"
+#define VECTORS_DIGEST "547bf4ff7f5369d3ba2d18eca05a2530b8daff0d3e6517471bc5ac0185122d13"
 
 /* Vectors this implementation fails: { id, why }, the list ends with { NULL, NULL }. */
 static const struct { const char* id; const char* why; } KNOWN_DISAGREEMENTS[] = {
@@ -1374,7 +1374,7 @@ static int check_read(rbl_pixel_reader* rd, const JV* r) {
         dg.camera_seq = ju32k(r, "camera_seq");
         dg.width = ju32k(r, "width");
         dg.height = ju32k(r, "height");
-        rc = rbl_pixel_reader_read_frame(rd, &dg, rgba, rgba_cap, depth, depth_cap, &got);
+        rc = jis(r, "latest", 0) ? rbl_pixel_reader_read_latest(rd, &dg, rgba, rgba_cap, depth, depth_cap, &got) : rbl_pixel_reader_read_frame(rd, &dg, rgba, rgba_cap, depth, depth_cap, &got);
     }
     if (strcmp(expect, "skip") == 0) {
         if (rc == RBL_OK) ret = failf("delivered frame %llu (%s)", (unsigned long long)got.frame, jstr_or(r, "why", ""));
@@ -2543,6 +2543,10 @@ int main(void) {
         return 2;
     }
     printf("vectors: %s\n", g_dir);
+    if (getenv("RBL_PIXEL_READERS_ONLY")) {
+        pixels = load_doc("pixelfiles.json"); test_pixel_readers(&pixels); jv_free(&pixels);
+        rbli_net_down(); return (g_failed_total || g_format_errors) ? 1 : 0;
+    }
 
     memset(&rr, 0, sizeof rr);
     test_sha256_known_answers(&rr);
