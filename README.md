@@ -296,12 +296,15 @@ tests/interop.sh
 
 ## Notes and limits
 
-- Developed and tested on macOS (arm64, clang). The Windows code (Winsock, `MapViewOfFile`, the MSVC atomics) was
-  written against the documentation and syntax-checked against stand-in headers, **not compiled with MSVC or run
-  on Windows**; the CI workflow builds and tests it there, but its results are not recorded here, so treat the Windows code as
-  unverified. GCC on Linux has not been tried either. The revision 6 Windows code (`BCryptGenRandom`, `CreateFileW` with
-  `CREATE_NEW`, `MoveFileExW`, `GetFileType`) is equally untested; `bcrypt` is linked by the CMake target and by the
-  `#pragma comment` for MSVC.
+- Developed on macOS (arm64, clang). On `windows-latest` the CI workflow configures the project with CMake for MSVC (x64),
+  builds it in Release (the library, the demo, the examples, the interop peer and the test programs) and runs `ctest`: the unit
+  tests (a host and a guest in one process over loopback), the shared protocol vectors, and the header compiled as C++. The
+  run on `main` of 2026-11-04 passed all three. That includes the Windows code (Winsock, `MapViewOfFile`, the MSVC atomics) and
+  the revision 6 Windows code (`BCryptGenRandom`, `CreateFileW` with `CREATE_NEW`, `MoveFileExW`, `GetFileType`); `bcrypt` is
+  linked by the CMake target and by the `#pragma comment` for MSVC. A few vector cases skip themselves on Windows (file modes,
+  symlinks, a pixel file shortened while mapped). **Never run on Windows:** the two-process demo (`tests/interop.sh`, which CI
+  runs on Linux and macOS only), the cross-language interop, a game process, and Wine. GCC on Linux has not been tried, and
+  neither has GCC or MinGW on Windows.
 - Winsock: each link calls `WSAStartup` and, when it is closed, `WSACleanup`; Windows counts them. If your own code uses sockets, hold your own `WSAStartup`
   reference (any game that uses Winsock does), or the last `rbl_link_close()` shuts Winsock down under your sockets.
 - Big-endian hosts: the datagram and JSON codecs are byte-order clean; the pixel file path swaps the lock word and
