@@ -1,5 +1,10 @@
 # link-c
 
+Native macOS builds require macOS 11.0 or newer. Set `MACOSX_DEPLOYMENT_TARGET=11.0`
+when compiling native libraries or executables; positional vector I/O uses the system
+`preadv` introduced in macOS 11.0. Older macOS versions are unsupported.
+
+
 A single-header **C99** implementation of the **rewrite-bridge passthrough link protocol v1** (contract
 revision 7), so that a game mod written in C or C++ (an SKSE or F4SE plugin, a ScriptHookV script, an Unreal
 or other native plugin) can be a **host** or a **guest** next to any other game or rewrite that speaks it.
@@ -178,7 +183,7 @@ deliberately broken copies of the header to check that they notice):
 
 - paced collision, at most 32 chunks per `rbl_link_poll`, a newer snapshot replaces queued chunks; a 4 MiB
   UDP receive buffer is requested;
-- a new `frame_channel` resets the frame staleness; datagrams are accepted only from `127.0.0.1:<peer port>`;
+- a new `frame_channel` requires a new pixel reader and cleared cached pixels; datagrams are accepted only from `127.0.0.1:<peer port>`;
 - poses only for spawned entities, at most 1024 live ones (`unknown_entity`, `spawn_ignored`);
 - `heartbeat_ms` 10 to 10000: out of range in a `hello` is a handshake error, in your own config it is clamped;
 - the pixel file reader: an absolute path to a regular file (not a symlink, FIFO, device or directory; checked

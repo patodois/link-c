@@ -8,6 +8,10 @@
 #   make interop    run tests/interop.sh (set RBL_FAKE_HOST, RBL_FAKE_GUEST, RBL_JAVA_CP for the other peers)
 #   make clean
 
+ifeq ($(shell uname -s),Darwin)
+export MACOSX_DEPLOYMENT_TARGET = 11.0
+endif
+
 CC      ?= cc
 CXX     ?= c++
 OPT     ?= -O2 -g

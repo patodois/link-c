@@ -1,4 +1,7 @@
 cmake_minimum_required(VERSION 3.10)
+if(APPLE)
+  set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "Minimum supported macOS version")
+endif()
 project(rewrite_link VERSION 0.3.0 LANGUAGES C CXX)
 
 # rewrite_link.h is a single header. Use it from another CMake project with
