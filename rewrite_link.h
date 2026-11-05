@@ -2432,9 +2432,9 @@ static void rbli_retire(rbl_link* l, rbli_sock sock, char* wbuf, size_t wlen, si
         m.u.bye.reason.len = strlen(bye);
         memset(&tmp, 0, sizeof tmp);
         tmp.wbuf = c.wbuf; tmp.wlen = c.wlen; tmp.wcap = c.wcap;
-        rbli_ctl_queue(&tmp, &m); /* if it cannot be queued (memory), the connection just closes */
+        int queued = rbli_ctl_queue(&tmp, &m); /* a failed queue closes without counting a sent line */
         c.wbuf = tmp.wbuf; c.wlen = tmp.wlen; c.wcap = tmp.wcap;
-        l->stats.lines_sent++;
+        if (queued == RBL_OK) l->stats.lines_sent++;
     }
     if (!rbli_closing_pump(&c, now)) return;
     if (l->nclosing == RBLI_MAX_CLOSING) { /* too many at once: the oldest is closed the hard way */

@@ -2598,8 +2598,19 @@ TEST(the_library_frees_everything_it_allocated) {
     CHECK_EQ(g_lib_allocs, g_lib_frees);
 }
 
+TEST(discarded_internal_bye_is_not_counted) {
+    rbl_config cfg;rbl_link* link;char* reason=(char*)malloc(RBL_MAX_LINE+1);
+    REQUIRE(reason!=NULL);memset(reason,'x',RBL_MAX_LINE);reason[RBL_MAX_LINE]=0;
+    rbl_config_init(&cfg,"test");cfg.control_port=1;
+    REQUIRE(rbl_link_guest(&cfg,&link)==RBL_OK);
+    rbli_retire(link,RBLI_BAD_SOCK,NULL,0,0,reason,rbli_mono_ms());
+    CHECK_EQ(link->stats.lines_sent,0);
+    rbl_link_close(link);free(reason);
+}
+
 int main(void) {
     printf("rewrite_link tests\n");
+    RUN(discarded_internal_bye_is_not_counted);
     RUN(layout_offsets);
     RUN(constants_match_contract);
     RUN(worked_example_encodes_byte_for_byte);
