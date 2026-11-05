@@ -3518,6 +3518,8 @@ struct rbl_pixel_reader {
     int fd;
 #endif
     rbl_pixel_info info;
+    uint8_t* plane_scratch;
+    size_t plane_capacity;
     uint64_t newest; /* last successfully copied frame for presentation */
     rbl_pixel_stats st;
 };
@@ -3535,6 +3537,36 @@ struct rbl_pixel_writer {
     rbl_pixel_info info;
     uint64_t frame_no;
 };
+
+#if defined(__APPLE__) || defined(__linux__)
+#include <sys/uio.h>
+static int rbli_vector_rows(rbl_pixel_reader* r, size_t at, size_t stride, size_t row, uint32_t height, void* dst) {
+    size_t gap=stride-row; uint32_t start;
+    if(gap>r->plane_capacity) {
+        uint8_t* next=(uint8_t*)REWRITE_LINK_REALLOC(r->plane_scratch,gap);
+        if(!next) return RBL_MISS_GONE;
+        r->plane_scratch=next;r->plane_capacity=gap;
+    }
+    for(start=0;start<height;start+=8) {
+        struct iovec vectors[16]; uint32_t rows=height-start,y; int first=0,count; size_t offset=at+(size_t)start*stride;
+        if(rows>8) rows=8;
+        for(y=0;y<rows;y++) {
+            vectors[2*y].iov_base=(uint8_t*)dst+(size_t)(start+y)*row;vectors[2*y].iov_len=row;
+            vectors[2*y+1].iov_base=r->plane_scratch;vectors[2*y+1].iov_len=gap;
+        }
+        count=(int)(2*rows-1);
+        while(first<count) {
+            ssize_t n=preadv(r->fd,vectors+first,count-first,(off_t)offset);size_t used;
+            if(n<0 && errno==EINTR) continue;
+            if(n<=0) return RBL_MISS_GONE;
+            used=(size_t)n;offset+=used;
+            while(first<count && used>=vectors[first].iov_len) {used-=vectors[first].iov_len;first++;}
+            if(first<count && used) {vectors[first].iov_base=(uint8_t*)vectors[first].iov_base+used;vectors[first].iov_len-=used;}
+        }
+    }
+    return RBL_OK;
+}
+#endif
 
 /* Bounded copies from the opened file. Unix never dereferences peer-owned file pages:
  * short reads and I/O errors are misses even if a truncation follows a successful fstat.
@@ -3556,9 +3588,39 @@ static int rbli_pixel_copy(const rbl_pixel_reader* r, size_t at, void* dst, size
 #endif
     return RBL_OK;
 }
-static int rbli_pixel_rows(const rbl_pixel_reader* r, size_t at, size_t stride, size_t row, uint32_t height, void* dst) {
+static int rbli_pixel_rows(rbl_pixel_reader* r, size_t at, size_t stride, size_t row, uint32_t height, void* dst) {
     uint32_t y;
     if (stride == row) return rbli_pixel_copy(r, at, dst, row * height);
+#if defined(__APPLE__) || defined(__linux__)
+    /* Reading wide padding costs more than the saved calls; keep those rows separate. */
+    if (stride <= 16u * 1024u && height>1 && (size_t)(height-1)*stride+row <= row*height*4u) return rbli_vector_rows(r,at,stride,row,height,dst);
+#endif
+#if !RBLI_WINDOWS
+    {
+        size_t span = (size_t)(height - 1) * stride + row;
+        size_t block_bytes = row > (32u << 10) ? row : (32u << 10);
+        uint32_t block_rows = (uint32_t)((block_bytes - row) / stride + 1u), start;
+        if (stride <= 16u * 1024u && span <= row * height * 4u && block_rows > 1 && height > 1) {
+            size_t capacity;
+            if (block_rows > height) block_rows = height;
+            capacity = (size_t)(block_rows - 1) * stride + row;
+            if (capacity > r->plane_capacity) {
+                uint8_t* next = (uint8_t*)REWRITE_LINK_REALLOC(r->plane_scratch, capacity);
+                if (!next) return RBL_MISS_GONE;
+                r->plane_scratch = next; r->plane_capacity = capacity;
+            }
+            for (start = 0; start < height; start += block_rows) {
+                uint32_t rows = height - start;
+                size_t bytes;
+                if (rows > block_rows) rows = block_rows;
+                bytes = (size_t)(rows - 1) * stride + row;
+                if (rbli_pixel_copy(r, at + (size_t)start * stride, r->plane_scratch, bytes)) return RBL_MISS_GONE;
+                for (y = 0; y < rows; y++) memcpy((uint8_t*)dst + (size_t)(start + y) * row, r->plane_scratch + (size_t)y * stride, row);
+            }
+            return RBL_OK;
+        }
+    }
+#endif
     for (y = 0; y < height; y++) {
         if (rbli_pixel_copy(r, at + (size_t)y * stride, (uint8_t*)dst + (size_t)y * row, row)) return RBL_MISS_GONE;
     }
@@ -3765,6 +3827,7 @@ RBLDEF int rbl_pixel_reader_read(rbl_pixel_reader* r, uint64_t frame, uint32_t s
 
 RBLDEF void rbl_pixel_reader_close(rbl_pixel_reader* r) {
     if (!r) return;
+    REWRITE_LINK_FREE(r->plane_scratch);
 #if RBLI_WINDOWS
     if (r->map) UnmapViewOfFile(r->map);
     if (r->mapping) CloseHandle(r->mapping);

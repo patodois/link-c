@@ -30,6 +30,13 @@ static ssize_t checked_pread(int fd, void* dst, size_t len, off_t offset) {
     }
     return pread(fd,dst,len,offset);
 }
+#include <sys/uio.h>
+static ssize_t checked_preadv(int fd,const struct iovec* vectors,int count,off_t offset) {
+    copy_calls++;
+    if(offset==truncate_at) {truncate_at=-1;if(ftruncate(truncate_fd,offset+64)) abort();}
+    return preadv(fd,vectors,count,offset);
+}
+#define preadv checked_preadv
 #define pread checked_pread
 #define fstat checked_fstat
 #define REWRITE_LINK_IMPLEMENTATION
@@ -88,22 +95,33 @@ static int order_test(void) {
     rbl_pixel_reader_close(ar);rbl_pixel_reader_close(br);rbl_pixel_writer_close(a);rbl_pixel_writer_close(b);
     printf("two-file presentation order: %s\n",fail?"FAIL":"ok");return fail;
 }
-
+static int gather_test(void) {
+    rbl_pixel_writer* w; rbl_pixel_reader* r; uint64_t no;
+    uint8_t px[128]={7};float depth[32]={2};rbl_frame f={1,0,0,8,4};int rc;
+    if(rbl_pixel_writer_create_temp("gather",16,8,1,1,&w)) return 2;
+    if(rbl_pixel_writer_write(w,px,128,depth,32,8,4,0,1,&no)) return 3;
+    if(rbl_pixel_reader_open(rbl_pixel_writer_path(w),&r)) return 4;
+    copy_calls=0;rc=rbl_pixel_reader_read_frame(r,&f,px,128,depth,32,NULL);
+    printf("cropped plane I/O: %u calls, rc=%d\n",copy_calls,rc);
+    rbl_pixel_reader_close(r);rbl_pixel_writer_close(w);return rc!=RBL_OK||copy_calls!=4;
+}
 static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1000.0+t.tv_nsec/1000000.0; }
 static int compare(const void* a,const void* b) { double x=*(const double*)a,y=*(const double*)b; return (x>y)-(x<y); }
 static int bench(void) {
-    const uint32_t sizes[][2] = {{1280,720},{1920,1080},{3840,2160},{8192,8192},{16384,1},{16384,4096}};
+    const uint32_t sizes[][4] = {{1280,720,1280,720},{1920,1080,1920,1080},{3840,2160,3840,2160},{8192,8192,8192,8192},{16384,1,16384,1},{16384,4096,16384,4096},{1920,1080,1280,720},{3840,2160,1920,1080},{16384,4096,8192,4096},{16384,4096,1,4096}};
     size_t i;
     for (i=0;i<sizeof sizes/sizeof sizes[0];i++) {
         int dep;
         for(dep=0;dep<2;dep++) {
-            uint32_t width=sizes[i][0],height=sizes[i][1]; size_t pixels=(size_t)width*height;
-            uint8_t* px=(uint8_t*)malloc(pixels*4); float* d=dep?(float*)malloc(pixels*4):NULL;
+            uint32_t fw=sizes[i][0],fh=sizes[i][1],width=sizes[i][2],height=sizes[i][3]; size_t pixels=(size_t)width*height;
+            uint8_t* px;
+            if(getenv("RBL_BENCH_CROPPED_ONLY") && width==fw) continue;
+            px=(uint8_t*)malloc(pixels*4); float* d=dep?(float*)malloc(pixels*4):NULL;
             rbl_pixel_writer* w; rbl_pixel_reader* r; uint64_t no; int j,n=pixels>10000000?5:30;
             rbl_frame f={1,0,0,width,height}; double times[30];
             if(!px || (dep&&!d)) return 2;
             memset(px,7,pixels*4); if(d) { size_t k; for(k=0;k<pixels;k++) d[k]=2; }
-            if(rbl_pixel_writer_create_temp("bench",width,height,1,dep,&w)) return 3;
+            if(rbl_pixel_writer_create_temp("bench",fw,fh,1,dep,&w)) return 3;
             if(rbl_pixel_writer_write(w,px,pixels*4,d,dep?pixels:0,width,height,0,1,&no)) return 4;
             if(rbl_pixel_reader_open(rbl_pixel_writer_path(w),&r)) return 5;
             for(j=0;j<n+2;j++) {
@@ -112,7 +130,7 @@ static int bench(void) {
                 if(j>=2) times[j-2]=now_ms()-start;
             }
             qsort(times,(size_t)n,sizeof(double),compare);
-            printf("c,%u,%u,%s,%d,%.6f,%.6f\n",width,height,dep?"true":"false",n,times[n/2],times[n*95/100]); fflush(stdout);
+            printf("c,%u,%u,%u,%u,%s,%d,%.6f,%.6f,%.6f\n",fw,fh,width,height,dep?"true":"false",n,times[n/10],times[n/2],times[n*95/100]); fflush(stdout);
             rbl_pixel_reader_close(r); rbl_pixel_writer_close(w); free(px); free(d);
         }
     }
@@ -123,8 +141,9 @@ int main(int argc,char** argv) {
     if(argc>1 && !strcmp(argv[1],"colour")) return plane_test(0);
     if(argc>1 && !strcmp(argv[1],"depth")) return plane_test(1);
     if(argc>1 && !strcmp(argv[1],"order")) return order_test();
+    if(argc>1 && !strcmp(argv[1],"gather")) return gather_test();
     if(argc>1) return child(argv[1]);
-    if(plane_test(0)||plane_test(1)||order_test()) return 1;
+    if(plane_test(0)||plane_test(1)||order_test()||gather_test()) return 1;
     {
         const char* modes[]={"open","read"}; int i,failed=0;
         for(i=0;i<2;i++) {
