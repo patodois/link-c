@@ -1660,7 +1660,7 @@ static void contention(int seqlock) {
             if (!c_whole(f, px, depth)) torn++;
         } else {
             /* the same copy with no lock check, to show that the writer does tear what is being read */
-            const uint8_t* base = r->map + 64 + (size_t)slot * (size_t)info.slot_size;
+            const uint8_t* base = c.w->map + 64 + (size_t)slot * (size_t)info.slot_size;
             if (rbli_get64(base + 8) != f) { rejected++; continue; }
             memcpy(px, base + 64, sizeof px);
             memcpy(depth, base + info.depth_offset, sizeof depth);

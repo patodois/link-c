@@ -59,3 +59,11 @@ enable_testing()
 add_test(NAME unit COMMAND test_link)
 add_test(NAME vectors COMMAND test_vectors WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME cxx COMMAND cxx_check)
+
+# POSIX-only size/access race, isolated in child processes. Windows prevents ordinary
+# truncation while a section is active and needs a separate platform test.
+if(NOT WIN32)
+  add_executable(pixel_safety tests/pixel_safety.c)
+  target_link_libraries(pixel_safety PRIVATE rewrite_link)
+  add_test(NAME pixel_safety COMMAND pixel_safety)
+endif()

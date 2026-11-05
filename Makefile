@@ -50,13 +50,15 @@ $(BUILD)/test_vectors_asan: tests/test_vectors.c rewrite_link.h | $(BUILD)
 $(BUILD)/cxx_check: tests/cxx_check.cpp tests/cxx_other.cpp rewrite_link.h | $(BUILD)
 	$(CXX) -std=c++11 $(WARN) $(OPT) tests/cxx_check.cpp tests/cxx_other.cpp -o $@
 
-test: $(BUILD)/test_link $(BUILD)/test_vectors
+test: $(BUILD)/test_link $(BUILD)/test_vectors $(BUILD)/pixel_safety
 	$(BUILD)/test_link
 	$(BUILD)/test_vectors
+	$(BUILD)/pixel_safety
 
-asan: $(BUILD)/test_link_asan $(BUILD)/test_vectors_asan
+asan: $(BUILD)/test_link_asan $(BUILD)/test_vectors_asan $(BUILD)/pixel_safety_asan
 	$(BUILD)/test_link_asan
 	$(BUILD)/test_vectors_asan
+	$(BUILD)/pixel_safety_asan
 
 cxx: $(BUILD)/cxx_check
 	$(BUILD)/cxx_check
@@ -68,3 +70,10 @@ clean:
 	rm -rf $(BUILD)
 
 .PHONY: all test asan cxx interop clean
+
+# Unix regression: the mapping race is contained in child processes.
+$(BUILD)/pixel_safety: tests/pixel_safety.c rewrite_link.h | $(BUILD)
+	$(CC) $(CSTD) $(WARN) $(OPT) tests/pixel_safety.c -o $@ $(LDLIBS)
+
+$(BUILD)/pixel_safety_asan: tests/pixel_safety.c rewrite_link.h | $(BUILD)
+	$(CC) $(CSTD) $(WARN) -O1 -g $(SAN) tests/pixel_safety.c -o $@ $(LDLIBS)

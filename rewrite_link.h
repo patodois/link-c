@@ -460,7 +460,7 @@ typedef enum rbl_event_type {
     RBL_EV_CAMERA,            /* u.camera */
     RBL_EV_POSES,             /* u.poses: only for entities the peer spawned, stale ones left out */
     RBL_EV_COLLISION,         /* u.collision: a complete snapshot */
-    RBL_EV_FRAME,             /* u.frame: a frame is ready in the peer's pixel file */
+    RBL_EV_FRAME,             /* u.frame: unvalidated announcement; use read_latest for presentation */
     RBL_EV_SPAWN,             /* u.spawn */
     RBL_EV_DESPAWN,           /* u.despawn */
     RBL_EV_FOCUS,             /* u.focus */
@@ -589,7 +589,7 @@ RBLDEF int rbl_pixel_reader_open(const char* path, rbl_pixel_reader** out);
 RBLDEF void rbl_pixel_reader_info(const rbl_pixel_reader* r, rbl_pixel_info* out);
 RBLDEF int rbl_pixel_reader_has_depth(const rbl_pixel_reader* r);
 /* 1 when the file is now shorter than the mapping (the peer truncated it) or cannot be examined.
- * rbl_pixel_reader_read() checks it before every read. */
+ * Reads also detect short positional I/O, so a later truncation is a miss on Unix. */
 RBLDEF int rbl_pixel_reader_is_gone(const rbl_pixel_reader* r);
 /* Reads the frame that a Frame datagram announced (what RBL_EV_FRAME carries: f->frame, f->slot,
  * f->width, f->height), the way contract section 9.6 says. The frame is skipped (RBL_MISS_OTHER_FRAME,
@@ -3398,7 +3398,7 @@ RBLDEF void rbl_link_stats(const rbl_link* l, rbl_stats* out) { *out = l->stats;
  * ---------------------------------------------------------------------------------------- */
 
 #if RBLI_MSVC
-static uint64_t rbli_ld_acquire(const void* p) {
+static inline uint64_t rbli_ld_acquire(const void* p) {
     uint64_t v = (uint64_t)__iso_volatile_load64((const volatile __int64*)p);
     MemoryBarrier();
     return v;
@@ -3417,7 +3417,7 @@ static void rbli_fence_full(void) { MemoryBarrier(); }
 #else
 #define RBLI_LE64(v) (v)
 #endif
-static uint64_t rbli_ld_acquire(const void* p) { return RBLI_LE64(__atomic_load_n((const uint64_t*)p, __ATOMIC_ACQUIRE)); }
+static inline uint64_t rbli_ld_acquire(const void* p) { return RBLI_LE64(__atomic_load_n((const uint64_t*)p, __ATOMIC_ACQUIRE)); }
 static uint64_t rbli_ld_relaxed(const void* p) { return RBLI_LE64(__atomic_load_n((const uint64_t*)p, __ATOMIC_RELAXED)); }
 static void rbli_st_relaxed(void* p, uint64_t v) { __atomic_store_n((uint64_t*)p, RBLI_LE64(v), __ATOMIC_RELAXED); }
 static void rbli_st_release(void* p, uint64_t v) { __atomic_store_n((uint64_t*)p, RBLI_LE64(v), __ATOMIC_RELEASE); }
@@ -3430,14 +3430,6 @@ static void rbli_fence_full(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
 #define RBLI_SLOT_HDR 64u
 
 /* Plane copies. The wire is little-endian; on a big-endian host the depth floats are swapped. */
-static void rbli_copy_f32_le(float* dst, const uint8_t* src, size_t n) {
-#if RBLI_BIG_ENDIAN
-    size_t i;
-    for (i = 0; i < n; i++) dst[i] = rbli_getf(src + 4 * i);
-#else
-    memcpy(dst, src, 4 * n);
-#endif
-}
 static void rbli_store_f32_le(uint8_t* dst, const float* src, size_t n) {
 #if RBLI_BIG_ENDIAN
     size_t i;
@@ -3542,9 +3534,39 @@ struct rbl_pixel_writer {
     uint64_t frame_no;
 };
 
+/* Bounded copies from the opened file. Unix never dereferences peer-owned file pages:
+ * short reads and I/O errors are misses even if a truncation follows a successful fstat.
+ * Windows retains the map; an active section prevents ordinary file truncation. */
+static int rbli_pixel_copy(const rbl_pixel_reader* r, size_t at, void* dst, size_t len) {
+    if (at > r->mapped || len > r->mapped - at) return RBL_MISS_GONE;
+#if RBLI_WINDOWS
+    memcpy(dst, r->map + at, len);
+#else
+    {
+        uint8_t* p = (uint8_t*)dst;
+        while (len) {
+            ssize_t n = pread(r->fd, p, len, (off_t)at);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) return RBL_MISS_GONE;
+            p += n; at += (size_t)n; len -= (size_t)n;
+        }
+    }
+#endif
+    return RBL_OK;
+}
+static int rbli_pixel_rows(const rbl_pixel_reader* r, size_t at, size_t stride, size_t row, uint32_t height, void* dst) {
+    uint32_t y;
+    if (stride == row) return rbli_pixel_copy(r, at, dst, row * height);
+    for (y = 0; y < height; y++) {
+        if (rbli_pixel_copy(r, at + (size_t)y * stride, (uint8_t*)dst + (size_t)y * row, row)) return RBL_MISS_GONE;
+    }
+    return RBL_OK;
+}
+
 RBLDEF int rbl_pixel_reader_open(const char* path, rbl_pixel_reader** out) {
     rbl_pixel_reader* r;
     uint64_t size;
+    uint8_t head[RBLI_FILE_HDR];
     int rc;
     if (!out) return RBL_ERR_ARGS;
     *out = NULL;
@@ -3582,11 +3604,15 @@ RBLDEF int rbl_pixel_reader_open(const char* path, rbl_pixel_reader** out) {
         if (!view) { CloseHandle(r->mapping); CloseHandle(r->file); REWRITE_LINK_FREE(r); return RBL_ERR_IO; }
         r->map = (const uint8_t*)view;
         r->mapped = (size_t)size;
+        /* The section now prevents truncation. A shrink before CreateFileMapping could
+         * have made the view shorter than the earlier size: reject before dereferencing it. */
+        if (!GetFileSizeEx(r->file, &sz) || sz.QuadPart < 0 || (uint64_t)sz.QuadPart < size) {
+            rbl_pixel_reader_close(r); return RBL_ERR_REFUSED;
+        }
     }
 #else
     {
         struct stat before, after;
-        void* view;
         if (lstat(path, &before) != 0) { REWRITE_LINK_FREE(r); return RBL_ERR_IO; }
         if (!S_ISREG(before.st_mode)) { REWRITE_LINK_FREE(r); return RBL_ERR_REFUSED; } /* symlink, FIFO, device, directory, socket */
         /* O_NONBLOCK: opening a FIFO a peer swapped in after the check above must not wait for a writer */
@@ -3612,14 +3638,13 @@ RBLDEF int rbl_pixel_reader_open(const char* path, rbl_pixel_reader** out) {
         }
         size = (uint64_t)after.st_size;
         if (size < RBLI_FILE_HDR || size > (uint64_t)((size_t)-1)) { close(r->fd); REWRITE_LINK_FREE(r); return RBL_ERR_REFUSED; }
-        view = mmap(NULL, (size_t)size, PROT_READ, MAP_SHARED, r->fd, 0);
-        if (view == MAP_FAILED) { close(r->fd); REWRITE_LINK_FREE(r); return RBL_ERR_IO; }
-        r->map = (const uint8_t*)view;
         r->mapped = (size_t)size;
     }
 #endif
     /* The sizes in the header come from the peer: none is trusted (see rbli_pf_validate). */
-    rc = rbli_pf_validate(r->map, size, &r->info);
+    rc = rbli_pixel_copy(r, 0, head, sizeof head);
+    if (rc == RBL_OK) rc = rbli_pf_validate(head, size, &r->info);
+    else rc = RBL_ERR_IO;
     if (rc != RBL_OK) {
         rbl_pixel_reader_close(r);
         return rc;
@@ -3647,9 +3672,11 @@ RBLDEF int rbl_pixel_reader_is_gone(const rbl_pixel_reader* r) {
 /* dw, dh: the Frame datagram's size, or both 0 with `have_size` 0 when the caller has none */
 static int rbli_pixel_read(rbl_pixel_reader* r, uint64_t frame, uint32_t slot, int have_size, uint32_t dw, uint32_t dh,
                            uint8_t* rgba, size_t rgba_cap, float* depth, size_t depth_cap, rbl_pixel_frame* info) {
-    const uint8_t* p;
+    uint8_t head[RBLI_SLOT_HDR], last[16];
+    const uint8_t* p = head;
+    size_t base;
     uint64_t l1, l2, f, time_us;
-    uint32_t cam, w, h, y;
+    uint32_t cam, w, h;
     size_t row, need_c, need_d;
     int want_depth;
     if (!r || !rgba) return RBL_ERR_ARGS;
@@ -3657,8 +3684,15 @@ static int rbli_pixel_read(rbl_pixel_reader* r, uint64_t frame, uint32_t slot, i
     if (frame == 0) { r->st.other_frame++; return RBL_MISS_OTHER_FRAME; } /* never delivered (contract 9.6, reader step 0) */
     if (have_size && (dw < 1 || dh < 1 || dw > r->info.width || dh > r->info.height)) { r->st.other_frame++; return RBL_MISS_OTHER_FRAME; }
     if (rbl_pixel_reader_is_gone(r)) { r->st.gone++; return RBL_MISS_GONE; } /* the next access to a shrunk file would fault */
-    p = r->map + RBLI_FILE_HDR + (size_t)slot * (size_t)r->info.slot_size; /* checked at open: inside the file */
-    l1 = rbli_ld_acquire(p); /* step 1 */
+    base = RBLI_FILE_HDR + (size_t)slot * (size_t)r->info.slot_size;
+#if RBLI_WINDOWS
+    l1 = rbli_ld_acquire(r->map + base);
+#endif
+    if (rbli_pixel_copy(r, base, head, sizeof head)) goto gone;
+#if !RBLI_WINDOWS
+    l1 = rbli_get64(head);
+#endif
+    rbli_fence_acquire(); /* step 1 */
     if (l1 & 1) { r->st.busy++; return RBL_MISS_BUSY; }
     f = rbli_get64(p + 8);
     time_us = rbli_get64(p + 16);
@@ -3676,23 +3710,33 @@ static int rbli_pixel_read(rbl_pixel_reader* r, uint64_t frame, uint32_t slot, i
     if (rgba_cap < need_c || (want_depth && depth_cap < need_d)) {
         /* too small for this frame, unless the header was torn by a writer in the middle of a write */
         rbli_fence_acquire();
-        if (rbli_ld_relaxed(p) != l1) { r->st.overwritten++; return RBL_MISS_OVERWRITTEN; }
+        if (rbli_pixel_copy(r, base, last, sizeof last)) goto gone;
+        if (rbli_get64(last) != l1) { r->st.overwritten++; return RBL_MISS_OVERWRITTEN; }
         return RBL_ERR_TOO_BIG;
     }
     row = (size_t)w * 4u;
-    for (y = 0; y < h; y++) memcpy(rgba + (size_t)y * row, p + RBLI_SLOT_HDR + (size_t)y * r->info.stride, row);
+    if (rbli_pixel_rows(r, base + RBLI_SLOT_HDR, r->info.stride, row, h, rgba)) goto gone;
     if (want_depth) {
-        for (y = 0; y < h; y++)
-            rbli_copy_f32_le(depth + (size_t)y * w, p + (size_t)r->info.depth_offset + (size_t)y * r->info.depth_stride, w);
+        if (rbli_pixel_rows(r, base + (size_t)r->info.depth_offset, r->info.depth_stride, row, h, depth)) goto gone;
+#if RBLI_BIG_ENDIAN
+        { size_t i; for (i=0;i<need_d;i++) depth[i] = rbli_getf((const uint8_t*)depth + 4*i); }
+#endif
     }
     rbli_fence_acquire(); /* step 3: the acquire fence, then l2 */
-    l2 = rbli_ld_relaxed(p);
-    if (l2 != l1 || rbli_get64(p + 8) != frame) { r->st.overwritten++; return RBL_MISS_OVERWRITTEN; }
+    if (rbli_pixel_copy(r, base, last, sizeof last)) goto gone;
+#if RBLI_WINDOWS
+    l2 = rbli_ld_relaxed(r->map + base);
+#else
+    l2 = rbli_get64(last);
+#endif
+    if (l2 != l1 || rbli_get64(last + 8) != frame) { r->st.overwritten++; return RBL_MISS_OVERWRITTEN; }
     if (info) {
         info->frame = f; info->time_us = time_us; info->camera_seq = cam; info->width = w; info->height = h;
         info->has_depth = want_depth;
     }
     return RBL_OK;
+gone:
+    r->st.gone++; return RBL_MISS_GONE;
 }
 
 RBLDEF int rbl_pixel_reader_read_frame(rbl_pixel_reader* r, const rbl_frame* f, uint8_t* rgba, size_t rgba_cap,
