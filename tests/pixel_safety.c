@@ -64,6 +64,27 @@ static int child(const char* mode) {
     rbl_pixel_reader_close(r); close(truncate_fd); rbl_pixel_writer_close(w);
     return 0;
 }
+static int width_test(void) {
+    int want,frame,j,k; const uint32_t widths[]={15,14,15,8,7,16,1,14,15};
+    for(want=0;want<2;want++) {
+        rbl_pixel_writer* w; rbl_pixel_reader* r; uint64_t no;
+        uint8_t pixels[16*9*4],got[16*9*4];float depth[16*9],copied[16*9];
+        if(rbl_pixel_writer_create_temp("widths",16,16,1,1,&w)) return 2;
+        if(rbl_pixel_reader_open(rbl_pixel_writer_path(w),&r)) return 3;
+        for(k=0;k<9;k++) {
+            uint32_t width=widths[k];int count=(int)width*9; rbl_frame f;
+            frame=k+1;
+            for(j=0;j<count*4;j++) pixels[j]=(uint8_t)(j*37+frame*11);
+            for(j=0;j<count;j++) depth[j]=(float)(j+frame*1000);
+            if(rbl_pixel_writer_write(w,pixels,(size_t)count*4,depth,(size_t)count,width,9,0,(uint64_t)frame,&no)) return 4;
+            memset(&f,0,sizeof f);f.frame=no;f.width=width;f.height=9;
+            if(rbl_pixel_reader_read_latest(r,&f,got,sizeof got,want?copied:NULL,want?16*9:0,NULL)) return 5;
+            if(memcmp(got,pixels,(size_t)count*4) || (want && memcmp(copied,depth,(size_t)count*sizeof(float)))) return 6;
+        }
+        rbl_pixel_reader_close(r);rbl_pixel_writer_close(w);
+    }
+    puts("width sequence: all colour and depth pixels match");return 0;
+}
 static int plane_test(int depth) {
     rbl_pixel_writer* w; rbl_pixel_reader* r;
     uint8_t px[128]={7}; float d[32]={2}; uint64_t no; int rc;
@@ -141,12 +162,13 @@ static int bench(void) {
 }
 int main(int argc,char** argv) {
     if(argc>1 && !strcmp(argv[1],"bench")) return bench();
+    if(argc>1 && !strcmp(argv[1],"widths")) return width_test();
     if(argc>1 && !strcmp(argv[1],"colour")) return plane_test(0);
     if(argc>1 && !strcmp(argv[1],"depth")) return plane_test(1);
     if(argc>1 && !strcmp(argv[1],"order")) return order_test();
     if(argc>1 && !strcmp(argv[1],"gather")) return gather_test();
     if(argc>1) return child(argv[1]);
-    if(plane_test(0)||plane_test(1)||order_test()||gather_test()) return 1;
+    if(width_test()||plane_test(0)||plane_test(1)||order_test()||gather_test()) return 1;
     {
         const char* modes[]={"open","read"}; int i,failed=0;
         for(i=0;i<2;i++) {
