@@ -82,7 +82,7 @@ static struct {
     int nhs_failed;
     uint32_t spawns[8], despawns[8];
     int nspawns, ndespawns;
-    unsigned cameras, cameras_seen, poses, poses_seen, frames_ok, frames_bad, frame_events;
+    unsigned cameras, cameras_seen, poses, poses_seen, frames_ok, frames_bad, frame_events, presentation_rejections;
     uint32_t collision_triangles;
     int collision_seen;
     char focus[4][24];
@@ -409,7 +409,7 @@ static void host_check_frame(unsigned k) {
              f->slot, f->camera_seq, f->width, f->height, k, k % FRAME_SLOTS, G.cam_seq[k], FRAME_W, FRAME_H);
         bad = 1;
     }
-    rc = rbl_pixel_reader_read_frame(G.reader, f, rgba, sizeof rgba, depth, FRAME_W * FRAME_H, &info);
+    rc = rbl_pixel_reader_read_latest(G.reader, f, rgba, sizeof rgba, depth, FRAME_W * FRAME_H, &info);
     if (rc != RBL_OK) { fail("reading frame %u from the pixel file: %s", k, rbl_strerror(rc)); G.frames_bad++; return; }
     exp_pixels(k, want_rgba, want_depth);
     if (info.frame != k || info.camera_seq != G.cam_seq[k] || info.width != FRAME_W || info.height != FRAME_H || info.time_us != BASE_US + 16666ull * k) {
@@ -422,6 +422,15 @@ static void host_check_frame(unsigned k) {
     if (memcmp(rgba, want_rgba, sizeof rgba) != 0) { fail("the colour of frame %u differs from the expected pixels", k); bad = 1; }
     if (info.has_depth && memcmp(depth, want_depth, sizeof depth) != 0) { fail("the depth of frame %u differs from the expected values", k); bad = 1; }
     if (bad) G.frames_bad++; else G.frames_ok++;
+    if (rbl_pixel_reader_read_frame(G.reader,f,rgba,sizeof rgba,NULL,0,NULL)!=RBL_OK ||
+        rbl_pixel_reader_read_latest(G.reader,f,rgba,sizeof rgba,NULL,0,NULL)==RBL_OK) fail("a readable duplicate was presented twice");
+    else G.presentation_rejections++;
+    if (k>1) {
+        const rbl_frame* old=&G.frames[k-1];
+        if (rbl_pixel_reader_read_frame(G.reader,old,rgba,sizeof rgba,NULL,0,NULL)!=RBL_OK ||
+            rbl_pixel_reader_read_latest(G.reader,old,rgba,sizeof rgba,NULL,0,NULL)==RBL_OK) fail("an older readable slot regressed presentation");
+        else G.presentation_rejections++;
+    }
 }
 
 static void run_host(void) {
@@ -567,7 +576,7 @@ static void print_result(const rbl_stats* st, int have_stats) {
     js_add(out, cap, &n, ",\"cameras\":%u,\"poses\":%u,\"collision_triangles\":%u,\"frames_ok\":%u,\"frames_bad\":%u,\"focus\":[", G.cameras, G.poses,
            (unsigned)G.collision_triangles, G.frames_ok, G.frames_bad);
     for (i = 0; i < G.nfocus; i++) { if (i) js_add(out, cap, &n, ","); json_str(out, cap, &n, G.focus[i]); }
-    js_add(out, cap, &n, "],\"lost_reason\":");
+    js_add(out, cap, &n, "],\"presentation_rejections\":%u,\"lost_reason\":", G.presentation_rejections);
     if (G.lost) json_str(out, cap, &n, G.lost_reason); else js_add(out, cap, &n, "null");
     if (have_stats)
         js_add(out, cap, &n, ",\"stats\":{\"malformed\":%llu,\"foreign\":%llu,\"stale\":%llu,\"unknown_entity\":%llu,\"spawn_ignored\":%llu}}",
