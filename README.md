@@ -348,4 +348,3 @@ tests/interop.sh
 | Configured `game` | Truncated to at most 255 UTF-8 bytes | Retained; a hello exceeding the encoded control-line limit is refused locally |
 | Disconnect `reason` | Truncated to at most 199 UTF-8 bytes | Retained; a bye exceeding the encoded control-line limit is refused locally |
 | Failed internal hello queue | Handshake fails and the rejected line is not counted | Handshake fails and the rejected line is not counted |
-
