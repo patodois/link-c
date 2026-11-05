@@ -31,6 +31,23 @@ static void t_lib_free(void* p) { if (p) g_lib_frees++; free(p); }
 #define REWRITE_LINK_REALLOC(p, n) t_lib_realloc((p), (n))
 #define REWRITE_LINK_FREE(p) t_lib_free(p)
 
+#if !defined(_WIN32)
+#include <sys/socket.h>
+#include <errno.h>
+/* Test-only control backpressure: UDP must not be assumed to wait for a queued spawn. */
+static int delayed_spawn_sends;
+static ssize_t test_control_send(int fd, const void* bytes, size_t length, int flags) {
+    if (getenv("RBL_TEST_DELAY_SPAWN_FIVE") && delayed_spawn_sends < 2 && length < 1024) {
+        char text[1024]; memcpy(text,bytes,length); text[length]=0;
+        if (strstr(text,"\"type\":\"spawn\"") && strstr(text,"\"entity\":5,")) {
+            delayed_spawn_sends++; errno=EWOULDBLOCK; return -1;
+        }
+    }
+    return send(fd,bytes,length,flags);
+}
+#define send test_control_send
+#endif
+
 #define REWRITE_LINK_IMPLEMENTATION
 #include "../rewrite_link.h"
 
@@ -57,6 +74,8 @@ static void t_fail(const char* file, int line, const char* what) {
 
 typedef void (*test_fn)(void);
 static void run_test(const char* name, test_fn fn) {
+    const char* filter=getenv("RBL_TEST_FILTER");
+    if (filter && !strstr(name,filter)) return;
     g_test_failed = 0;
     fn();
     if (g_test_failed) { g_failed++; printf("FAIL %s\n", name); }
@@ -1876,6 +1895,8 @@ TEST(review_only_spawned_entities_have_pose_state_at_most_1024) {
     rbl_pose two[2];
     REQUIRE(pair_open(&p));
     CHECK_EQ(rbl_link_spawn(p.guest, 5, "P", "a", NULL), RBL_OK);
+    WAIT_UNTIL(3000, pair_pump(&p), p.hc.spawns == 1, ok);
+    REQUIRE(ok); /* control publication must precede the positive pose assertion */
     t = rbl_now_us();
     rbl_pose_identity(&two[0], 5, t); rbl_pose_identity(&two[1], 6, t);
     CHECK_EQ(rbl_link_send_poses(p.guest, two, 2), RBL_OK);
