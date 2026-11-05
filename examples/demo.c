@@ -141,11 +141,17 @@ static int run_host(rbl_link* link, double seconds) {
             }
             case RBL_EV_FRAME: {
                 rbl_pixel_frame fi;
-                if (reader && rbl_pixel_reader_read_latest(reader, &e->u.frame.frame, px, px_cap, depth, depth_cap, &fi) == RBL_OK) {
+                int rc = reader ? rbl_pixel_reader_read_latest(reader, &e->u.frame.frame, px, px_cap, depth, depth_cap, &fi) : RBL_MISS_OTHER_FRAME;
+                if (rc == RBL_OK) {
                     frames_read++;
                     describe(last_frame, sizeof last_frame, &fi, px, depth);
                 } else {
                     frames_missed++;
+                    if (rc == RBL_MISS_GONE) {
+                        rbl_pixel_reader_close(reader); reader = NULL;
+                        snprintf(last_frame, sizeof last_frame, "none");
+                        logf_("host", "pixel file gone; cleared cached frame");
+                    }
                 }
                 break;
             }
