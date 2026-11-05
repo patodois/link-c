@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdint.h>
 static int truncate_fd = -1, armed;
 static int checked_fstat(int fd, struct stat* st) {
     int rc = fstat(fd, st);
@@ -24,9 +25,12 @@ static int checked_fstat(int fd, struct stat* st) {
     return rc;
 }
 static off_t truncate_at = -1;
-static unsigned copy_calls;
+static unsigned copy_calls, short_vector_calls;
+static size_t vector_cap;
+static int identity_fd=-1, identity_reads;
 static ssize_t checked_pread(int fd, void* dst, size_t len, off_t offset) {
     copy_calls++;
+    if(identity_fd>=0 && offset==64 && ++identity_reads==2) {uint64_t next=2; if(pwrite(identity_fd,&next,8,72)!=8) abort();}
     if (offset == truncate_at) {
         truncate_at = -1;
         if (ftruncate(truncate_fd, offset + 64)) abort();
@@ -37,6 +41,7 @@ static ssize_t checked_pread(int fd, void* dst, size_t len, off_t offset) {
 static ssize_t checked_preadv(int fd,const struct iovec* vectors,int count,off_t offset) {
     copy_calls++;
     if(offset==truncate_at) {truncate_at=-1;if(ftruncate(truncate_fd,offset+64)) abort();}
+    if(vector_cap) {struct iovec one=vectors[0];if(one.iov_len>vector_cap)one.iov_len=vector_cap;short_vector_calls++;return preadv(fd,&one,1,offset);}
     return preadv(fd,vectors,count,offset);
 }
 #define preadv checked_preadv
@@ -78,8 +83,8 @@ static int width_test(void) {
             for(j=0;j<count;j++) depth[j]=(float)(j+frame*1000);
             if(rbl_pixel_writer_write(w,pixels,(size_t)count*4,depth,(size_t)count,width,9,0,(uint64_t)frame,&no)) return 4;
             memset(&f,0,sizeof f);f.frame=no;f.width=width;f.height=9;
-            if(rbl_pixel_reader_read_latest(r,&f,got,sizeof got,want?copied:NULL,want?16*9:0,NULL)) return 5;
-            if(memcmp(got,pixels,(size_t)count*4) || (want && memcmp(copied,depth,(size_t)count*sizeof(float)))) return 6;
+            if(rbl_pixel_reader_read_latest(r,&f,got,sizeof got,want?copied:NULL,want?16*9:0,NULL)) {printf("FAIL width %u frame %d: copy rejected\n",width,frame);return 5;}
+            if(memcmp(got,pixels,(size_t)count*4) || (want && memcmp(copied,depth,(size_t)count*sizeof(float)))) {printf("FAIL width %u frame %d: wrong pixels\n",width,frame);return 6;}
         }
         rbl_pixel_reader_close(r);rbl_pixel_writer_close(w);
     }
@@ -100,6 +105,17 @@ static int plane_test(int depth) {
     printf("partial %s: rc=%d expected=%d\n",depth?"depth":"colour",rc,RBL_MISS_GONE);
     return rc==RBL_MISS_GONE?0:1;
 }
+static int identity_test(void) {
+    rbl_pixel_writer* w;rbl_pixel_reader* r;uint8_t px[128]={7};uint64_t no;rbl_frame f={1,0,0,8,4};int rc;
+    if(rbl_pixel_writer_create_temp("identity",8,4,1,0,&w))return 2;
+    if(rbl_pixel_writer_write(w,px,sizeof px,NULL,0,8,4,0,1,&no))return 3;
+    if(rbl_pixel_reader_open(rbl_pixel_writer_path(w),&r))return 4;
+    identity_fd=open(rbl_pixel_writer_path(w),O_WRONLY);identity_reads=0;
+    rc=rbl_pixel_reader_read_frame(r,&f,px,sizeof px,NULL,0,NULL);
+    close(identity_fd);identity_fd=-1;rbl_pixel_reader_close(r);rbl_pixel_writer_close(w);
+    printf("final frame identity: rc=%d expected=%d\n",rc,RBL_MISS_OVERWRITTEN);return rc!=RBL_MISS_OVERWRITTEN;
+}
+static int short_test(void) {int rc;vector_cap=7;short_vector_calls=0;rc=width_test();vector_cap=0;printf("short vector calls: %u\n",short_vector_calls);return rc||short_vector_calls==0;}
 static int order_test(void) {
     rbl_pixel_writer *a,*b; rbl_pixel_reader *ar,*br;
     uint8_t px[24]={7}; float depth[6]={2}; uint64_t no; int i,fail=0;
@@ -162,13 +178,15 @@ static int bench(void) {
 }
 int main(int argc,char** argv) {
     if(argc>1 && !strcmp(argv[1],"bench")) return bench();
+    if(argc>1 && !strcmp(argv[1],"short")) return short_test();
+    if(argc>1 && !strcmp(argv[1],"identity")) return identity_test();
     if(argc>1 && !strcmp(argv[1],"widths")) return width_test();
     if(argc>1 && !strcmp(argv[1],"colour")) return plane_test(0);
     if(argc>1 && !strcmp(argv[1],"depth")) return plane_test(1);
     if(argc>1 && !strcmp(argv[1],"order")) return order_test();
     if(argc>1 && !strcmp(argv[1],"gather")) return gather_test();
     if(argc>1) return child(argv[1]);
-    if(width_test()||plane_test(0)||plane_test(1)||order_test()||gather_test()) return 1;
+    if(short_test()||identity_test()||width_test()||plane_test(0)||plane_test(1)||order_test()||gather_test()) return 1;
     {
         const char* modes[]={"open","read"}; int i,failed=0;
         for(i=0;i<2;i++) {
