@@ -24,8 +24,10 @@
 
 /* The library's allocator hooks, counting: every allocation the library makes must be freed. */
 static size_t g_lib_allocs, g_lib_frees;
+static int g_fail_realloc;
+static unsigned g_failed_reallocs;
 static void* t_lib_malloc(size_t n) { void* p = malloc(n); if (p) g_lib_allocs++; return p; }
-static void* t_lib_realloc(void* old, size_t n) { void* p = realloc(old, n); if (p && !old) g_lib_allocs++; return p; }
+static void* t_lib_realloc(void* old, size_t n) { void* p; if(g_fail_realloc) {g_failed_reallocs++;return NULL;} p = realloc(old, n); if (p && !old) g_lib_allocs++; return p; }
 static void t_lib_free(void* p) { if (p) g_lib_frees++; free(p); }
 #define REWRITE_LINK_MALLOC(n) t_lib_malloc(n)
 #define REWRITE_LINK_REALLOC(p, n) t_lib_realloc((p), (n))
@@ -2598,6 +2600,47 @@ TEST(the_library_frees_everything_it_allocated) {
     CHECK_EQ(g_lib_allocs, g_lib_frees);
 }
 
+TEST(guest_hello_queue_failure_is_visible_and_not_counted) {
+    rbl_config cfg; rbl_link *host, *guest; uint64_t deadline; Col seen={0};
+    rbl_config_init(&cfg,"host");cfg.control_port=0;
+    REQUIRE(rbl_link_host(&cfg,&host)==RBL_OK);
+    rbl_config_init(&cfg,"guest");cfg.control_port=host->control_port;
+    REQUIRE(rbl_link_guest(&cfg,&guest)==RBL_OK);
+    rbli_poll_connect(guest,rbli_mono_ms());
+    deadline=rbli_mono_ms()+2000;
+    while(rbli_tcp_connect_check(guest->connecting)!=1 && rbli_mono_ms()<deadline) rbli_sleep_ms(1);
+    REQUIRE(rbli_tcp_connect_check(guest->connecting)==1);
+    g_fail_realloc=1;g_failed_reallocs=0;
+    rbli_poll_connect(guest,rbli_mono_ms());
+    g_fail_realloc=0;
+    CHECK(g_failed_reallocs>0);
+    CHECK_EQ(guest->stats.lines_sent,0);
+    CHECK_EQ(guest->state,RBLI_IDLE);
+    col_poll(guest,&seen);
+    CHECK_EQ(seen.hsfail,1);
+    CHECK(strstr(seen.hsfail_reason,"local hello")!=NULL);
+    rbl_link_close(guest);rbl_link_close(host);
+}
+
+TEST(host_hello_queue_failure_cannot_connect_or_count_a_line) {
+    rbl_config cfg; rbl_link *host, *guest; rbl_control hello; char reason[200];int rc;
+    rbl_config_init(&cfg,"host");cfg.control_port=0;
+    REQUIRE(rbl_link_host(&cfg,&host)==RBL_OK);
+    rbl_config_init(&cfg,"guest");cfg.control_port=host->control_port;
+    REQUIRE(rbl_link_guest(&cfg,&guest)==RBL_OK);
+    rbli_hello_for(guest,&hello,RBL_VERSION,0,0);
+    host->state=RBLI_HANDSHAKE;
+    g_fail_realloc=1;g_failed_reallocs=0;
+    rc=rbli_on_hello(host,&hello,rbli_mono_ms(),reason,sizeof reason);
+    g_fail_realloc=0;
+    CHECK(g_failed_reallocs>0);
+    CHECK_EQ(rc,1);
+    CHECK_EQ(host->stats.lines_sent,0);
+    CHECK(!rbl_link_is_connected(host));
+    if(rc) CHECK(strstr(reason,"local hello")!=NULL);
+    rbl_link_close(guest);rbl_link_close(host);
+}
+
 TEST(discarded_internal_bye_is_not_counted) {
     rbl_config cfg;rbl_link* link;char* reason=(char*)malloc(RBL_MAX_LINE+1);
     REQUIRE(reason!=NULL);memset(reason,'x',RBL_MAX_LINE);reason[RBL_MAX_LINE]=0;
@@ -2610,6 +2653,8 @@ TEST(discarded_internal_bye_is_not_counted) {
 
 int main(void) {
     printf("rewrite_link tests\n");
+    RUN(guest_hello_queue_failure_is_visible_and_not_counted);
+    RUN(host_hello_queue_failure_cannot_connect_or_count_a_line);
     RUN(discarded_internal_bye_is_not_counted);
     RUN(layout_offsets);
     RUN(constants_match_contract);

@@ -2625,11 +2625,14 @@ static void rbli_poll_connect(rbl_link* l, uint64_t now) {
             l->connecting = RBLI_BAD_SOCK;
             rbli_nodelay(l->ctl.sock);
             rbli_hello_for(l, &m, RBL_VERSION, 0, 0);
-            rbli_ctl_queue(&l->ctl, &m);
-            l->stats.lines_sent++;
-            rbli_ctl_flush(&l->ctl);
             l->state = RBLI_HANDSHAKE;
             l->since = now;
+            if (rbli_ctl_queue(&l->ctl, &m) != RBL_OK) {
+                rbli_end(l, "cannot queue local hello", 0);
+                return;
+            }
+            l->stats.lines_sent++;
+            rbli_ctl_flush(&l->ctl);
         } else if (r < 0 || now - l->since > 1000) {
             rbli_abort_connect(l, now);
         }
@@ -2690,7 +2693,10 @@ static int rbli_on_hello(rbl_link* l, const rbl_control* c, uint64_t now, char* 
     if ((uint64_t)4 * c->u.hello.heartbeat_ms > timeout) timeout = (uint64_t)4 * c->u.hello.heartbeat_ms;
     if (l->role == RBL_ROLE_HOST) {
         rbli_hello_for(l, &reply, protocol, 1, session);
-        rbli_ctl_queue(&l->ctl, &reply);
+        if (rbli_ctl_queue(&l->ctl, &reply) != RBL_OK) {
+            snprintf(reason, rcap, "cannot queue local hello");
+            return 1;
+        }
         l->stats.lines_sent++;
         rbli_ctl_flush(&l->ctl);
     }

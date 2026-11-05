@@ -328,5 +328,17 @@ tests/interop.sh
   reference (any game that uses Winsock does), or the last `rbl_link_close()` shuts Winsock down under your sockets.
 - Big-endian hosts: the datagram and JSON codecs are byte-order clean; the pixel file path swaps the lock word and
   depth floats but has not been run.
-- Strings that you pass in must be UTF-8 (invalid sequences are replaced by U+FFFD). `game` is cut at 255 bytes,
-  a peer's game name at 127.
+- Strings that you pass in must be UTF-8 (invalid sequences are replaced by U+FFFD). The configured `game`
+  is copied at a UTF-8 boundary using at most 255 bytes; a peer's displayed game name uses at most 127.
+  Disconnect and reported failure `reason` strings use at most 199 bytes, also cut at a UTF-8 boundary.
+  These fixed-capacity C API strings are truncated before serialization. They are not rejections of an
+  oversized control line; the 65536-byte encoded control-line limit still applies to every queued message.
+
+### Control string differences
+
+| Input | C | Rust, C# and Java |
+|---|---|---|
+| Configured `game` | Truncated to at most 255 UTF-8 bytes | Retained; a hello exceeding the encoded control-line limit is refused locally |
+| Disconnect `reason` | Truncated to at most 199 UTF-8 bytes | Retained; a bye exceeding the encoded control-line limit is refused locally |
+| Failed internal hello queue | Handshake fails and the rejected line is not counted | Handshake fails and the rejected line is not counted |
+
