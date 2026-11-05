@@ -1703,10 +1703,10 @@ TEST(review_a_new_frame_channel_restarts_frame_numbers) {
     for (f = 1; f <= 10; f++) { rbl_frame fr; fr.frame = f; fr.slot = (uint32_t)(f % 3); fr.camera_seq = 0; fr.width = 16; fr.height = 8; rbl_link_send_frame(p.guest, &fr); }
     WAIT_UNTIL(2000, pair_pump(&p), p.hc.frames == 10, ok);
     CHECK(ok);
-    /* the same numbers again without a new channel are stale */
-    { rbl_frame fr; rbl_stats s0 = stats_of(p.host); fr.frame = 5; fr.slot = 2; fr.camera_seq = 0; fr.width = 16; fr.height = 8;
+    /* Transport delivers repeats too: only a validated consumer can decide staleness. */
+    { rbl_frame fr; fr.frame = 5; fr.slot = 2; fr.camera_seq = 0; fr.width = 16; fr.height = 8;
       rbl_link_send_frame(p.guest, &fr);
-      WAIT_UNTIL(300, pair_pump(&p), stats_of(p.host).stale > s0.stale, ok); CHECK(ok); CHECK_EQ(p.hc.frames, 10); }
+      WAIT_UNTIL(1000, pair_pump(&p), p.hc.frames == 11, ok); CHECK(ok); }
     p.hc.frames = 0;
     CHECK_EQ(rbl_link_announce_frames(p.guest, "/tmp/second.frames", 32, 16, 3), RBL_OK);
     WAIT_UNTIL(2000, pair_pump(&p), p.hc.frame_channels == 1, ok);
@@ -1717,6 +1717,36 @@ TEST(review_a_new_frame_channel_restarts_frame_numbers) {
     CHECK(ok);
     CHECK_EQ(p.hc.frames, 5); /* frames 1..5 of the new channel */
     pair_close(&p);
+}
+
+TEST(late_old_udp_does_not_poison_the_new_channel) {
+    Pair p; int ok; rbl_frame f; rbl_pixel_writer* w; rbl_pixel_reader* r;
+    uint8_t px[16] = {9}; char path[1024]; uint64_t number;
+    REQUIRE(pair_open(&p));
+    REQUIRE(rbl_pixel_writer_create_temp("order", 2, 2, 3, 0, &w) == RBL_OK);
+    REQUIRE(rbl_pixel_writer_write(w, px, sizeof px, NULL, 0, 2, 2, 0, 1, &number) == RBL_OK);
+    f.frame = number; f.slot = (uint32_t)(number % 3); f.camera_seq = 0; f.width = 2; f.height = 2;
+    snprintf(path, sizeof path, "%s", rbl_pixel_writer_path(w));
+    REQUIRE(rbl_pixel_reader_open(path, &r) == RBL_OK);
+    REQUIRE(rbl_link_announce_frames(p.guest, path, 2, 2, 3) == RBL_OK);
+    WAIT_UNTIL(1000, pair_pump(&p), p.hc.frame_channels == 1, ok); CHECK(ok);
+    f.frame = UINT64_MAX;
+    rbl_link_send_frame(p.guest, &f);
+    WAIT_UNTIL(1000, pair_pump(&p), p.hc.frames == 1, ok); CHECK(ok);
+    CHECK(rbl_pixel_reader_read_latest(r, &f, px, sizeof px, NULL, 0, NULL) != RBL_OK);
+    f.frame = 1;
+    rbl_link_send_frame(p.guest, &f);
+    WAIT_UNTIL(1000, pair_pump(&p), p.hc.frames == 2, ok);
+    CHECK(ok); CHECK_EQ(p.hc.frames, 2);
+    CHECK_EQ(rbl_pixel_reader_read_latest(r, &f, px, sizeof px, NULL, 0, NULL), RBL_OK);
+    CHECK(rbl_pixel_reader_read_latest(r, &f, px, sizeof px, NULL, 0, NULL) != RBL_OK);
+    REQUIRE(rbl_pixel_writer_write(w, px, sizeof px, NULL, 0, 2, 2, 0, 2, &number) == RBL_OK);
+    f.frame = number; f.slot = (uint32_t)(number % 3);
+    CHECK_EQ(rbl_pixel_reader_read_latest(r, &f, px, sizeof px, NULL, 0, NULL), RBL_OK);
+    f.frame = 1; f.slot = 1;
+    CHECK_EQ(rbl_pixel_reader_read_frame(r, &f, px, sizeof px, NULL, 0, NULL), RBL_OK);
+    CHECK(rbl_pixel_reader_read_latest(r, &f, px, sizeof px, NULL, 0, NULL) != RBL_OK);
+    rbl_pixel_reader_close(r); rbl_pixel_writer_close(w); pair_close(&p);
 }
 
 static rbl_triangle* make_tris(size_t n) {
@@ -2591,6 +2621,7 @@ int main(void) {
     RUN(review_a_file_truncated_under_a_reader_is_gone_not_a_crash);
 #endif
     RUN(pixel_file_seqlock_under_contention);
+    RUN(late_old_udp_does_not_poison_the_new_channel);
     RUN(review_a_new_frame_channel_restarts_frame_numbers);
     RUN(review_a_400_chunk_collision_snapshot_completes);
     RUN(review_collision_chunks_are_paced_and_a_newer_snapshot_replaces_queued_ones);

@@ -120,6 +120,7 @@ static int run_host(rbl_link* link, double seconds) {
                 next_collision = t;
                 break;
             case RBL_EV_FRAME_CHANNEL: {
+                snprintf(last_frame, sizeof last_frame, "none");
                 rbl_pixel_info info;
                 if (reader) { rbl_pixel_reader_close(reader); reader = NULL; }
                 if (e->u.frame_channel.path && rbl_pixel_reader_open(e->u.frame_channel.path, &reader) == RBL_OK) {
@@ -140,7 +141,7 @@ static int run_host(rbl_link* link, double seconds) {
             }
             case RBL_EV_FRAME: {
                 rbl_pixel_frame fi;
-                if (reader && rbl_pixel_reader_read_frame(reader, &e->u.frame.frame, px, px_cap, depth, depth_cap, &fi) == RBL_OK) {
+                if (reader && rbl_pixel_reader_read_latest(reader, &e->u.frame.frame, px, px_cap, depth, depth_cap, &fi) == RBL_OK) {
                     frames_read++;
                     describe(last_frame, sizeof last_frame, &fi, px, depth);
                 } else {
@@ -149,6 +150,7 @@ static int run_host(rbl_link* link, double seconds) {
                 break;
             }
             case RBL_EV_LOST:
+                snprintf(last_frame, sizeof last_frame, "none");
                 if (reader) { rbl_pixel_reader_close(reader); reader = NULL; }
                 logf_("host", "LOST the guest: %s", e->u.lost.text);
                 break;

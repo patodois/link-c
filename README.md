@@ -311,3 +311,12 @@ tests/interop.sh
   depth floats but has not been run.
 - Strings that you pass in must be UTF-8 (invalid sequences are replaced by U+FFFD). `game` is cut at 255 bytes,
   a peer's game name at 127.
+
+### Ordem de apresentação de pixels
+
+Os eventos Frame são anúncios ainda não validados. Ao trocar frame_channel ou perder a sessão,
+limpe a imagem anterior e descarte o leitor anterior, inclusive se o novo arquivo não abrir.
+Use a leitura de apresentação read_latest (Rust/C), ReadLatest (C#) ou readLatest (Java):
+só uma cópia válida avança o maior número do arquivo atual. As leituras brutas continuam
+permitindo releituras e não implementam ordem de apresentação. Consumidores assíncronos devem
+associar trabalhos e resultados à instância do leitor e rejeitar resultados de leitores substituídos.

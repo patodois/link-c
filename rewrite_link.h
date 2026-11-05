@@ -602,6 +602,11 @@ RBLDEF int rbl_pixel_reader_is_gone(const rbl_pixel_reader* r);
  * RBL_ERR_TOO_BIG if a buffer is too small, or RBL_ERR_ARGS. */
 RBLDEF int rbl_pixel_reader_read_frame(rbl_pixel_reader* r, const rbl_frame* f, uint8_t* rgba, size_t rgba_cap,
                                        float* depth, size_t depth_cap, rbl_pixel_frame* info);
+/* For presentation: only a successful copy advances this reader's frame number. A new
+ * channel needs a new reader and must invalidate any displayed pixels, even if open fails.
+ * read_frame and read remain unordered low-level copies. Readers are not thread-safe. */
+RBLDEF int rbl_pixel_reader_read_latest(rbl_pixel_reader* r, const rbl_frame* f, uint8_t* rgba, size_t rgba_cap,
+                                        float* depth, size_t depth_cap, rbl_pixel_frame* info);
 /* The same without the datagram's size: for a caller that has only the frame number and the slot. The
  * slot header's width and height are checked against the file's (0 or above it is a skip) but not
  * against the datagram's, which this call does not see. Kept so that existing programs still build;
@@ -2162,7 +2167,6 @@ struct rbl_link {
     float asm_center[3], asm_radius;
     uint64_t asm_tris;
     rbli_chunk* asm_chunks;
-    uint64_t last_frame;
 
     rbl_stats stats;
 
@@ -2481,7 +2485,6 @@ static void rbli_reset_session(rbl_link* l) {
     rbli_cq_clear(l);
     l->has_last_collision = 0;
     rbli_asm_clear(l);
-    l->last_frame = 0;
 }
 
 /* Ends the current connection, reporting it as lost (or as a failed handshake). */
@@ -2790,7 +2793,6 @@ static int rbli_on_line(rbl_link* l, char* line, size_t len, uint64_t now, char*
         /* A new pixel file numbers its frames from 1 again (CONTRACT.md 8). */
         char* path = rbli_arena_str(l, m.u.frame_channel.path);
         rbl_event* e;
-        l->last_frame = 0;
         if (!path) { l->stats.dropped++; return 0; }
         e = rbli_ev_push(l, RBL_EV_FRAME_CHANNEL);
         if (e) {
@@ -2945,8 +2947,6 @@ static void rbli_on_datagram(rbl_link* l, const rbl_decoded* d) {
         break;
     case RBL_FRAME: {
         rbl_event* e;
-        if (d->u.frame.frame <= l->last_frame) { l->stats.stale++; return; }
-        l->last_frame = d->u.frame.frame;
         e = rbli_ev_push(l, RBL_EV_FRAME);
         if (e) { e->u.frame.header = d->header; e->u.frame.frame = d->u.frame; }
         break;
@@ -3524,6 +3524,7 @@ struct rbl_pixel_reader {
     int fd;
 #endif
     rbl_pixel_info info;
+    uint64_t newest; /* last successfully copied frame for presentation */
     rbl_pixel_stats st;
 };
 
@@ -3698,6 +3699,16 @@ RBLDEF int rbl_pixel_reader_read_frame(rbl_pixel_reader* r, const rbl_frame* f, 
                                        float* depth, size_t depth_cap, rbl_pixel_frame* info) {
     if (!f) return RBL_ERR_ARGS;
     return rbli_pixel_read(r, f->frame, f->slot, 1, f->width, f->height, rgba, rgba_cap, depth, depth_cap, info);
+}
+
+RBLDEF int rbl_pixel_reader_read_latest(rbl_pixel_reader* r, const rbl_frame* f, uint8_t* rgba, size_t rgba_cap,
+                                        float* depth, size_t depth_cap, rbl_pixel_frame* info) {
+    int rc;
+    if (!r || !f) return RBL_ERR_ARGS;
+    if (f->frame <= r->newest) { r->st.other_frame++; return RBL_MISS_OTHER_FRAME; }
+    rc = rbl_pixel_reader_read_frame(r, f, rgba, rgba_cap, depth, depth_cap, info);
+    if (rc == RBL_OK) r->newest = f->frame;
+    return rc;
 }
 
 RBLDEF int rbl_pixel_reader_read(rbl_pixel_reader* r, uint64_t frame, uint32_t slot, uint8_t* rgba, size_t rgba_cap,
