@@ -2,7 +2,14 @@
 
 Native macOS builds require macOS 11.0 or newer. Set `MACOSX_DEPLOYMENT_TARGET=11.0`
 when compiling native libraries or executables; positional vector I/O uses the system
-`preadv` introduced in macOS 11.0. Older macOS versions are unsupported.
+`preadv` introduced in macOS 11.0. When compiling this header with a deployment target below
+11.0, the reader selects bounded `pread` copies at compile time and never calls `preadv`.
+Other requirements on older macOS versions have not been validated; the supported minimum remains 11.0.
+
+When using `add_subdirectory(link-c)` from a CMake parent project, set
+`CMAKE_OSX_DEPLOYMENT_TARGET` to at least `11.0` before the parent's first `project()` call.
+The parent controls this cached setting; adding the subproject does not raise an existing target.
+The standalone CMake build and Makefile default to 11.0.
 
 
 A single-header **C99** implementation of the **rewrite-bridge passthrough link protocol v1** (contract

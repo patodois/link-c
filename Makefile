@@ -10,6 +10,8 @@
 
 ifeq ($(shell uname -s),Darwin)
 export MACOSX_DEPLOYMENT_TARGET = 11.0
+LEGACY_TEST = $(BUILD)/pixel_macos_legacy
+LEGACY_ASAN = $(BUILD)/pixel_macos_legacy_asan
 endif
 
 CC      ?= cc
@@ -54,15 +56,17 @@ $(BUILD)/test_vectors_asan: tests/test_vectors.c rewrite_link.h | $(BUILD)
 $(BUILD)/cxx_check: tests/cxx_check.cpp tests/cxx_other.cpp rewrite_link.h | $(BUILD)
 	$(CXX) -std=c++11 $(WARN) $(OPT) tests/cxx_check.cpp tests/cxx_other.cpp -o $@
 
-test: $(BUILD)/test_link $(BUILD)/test_vectors $(BUILD)/pixel_safety
+test: $(BUILD)/test_link $(BUILD)/test_vectors $(BUILD)/pixel_safety $(LEGACY_TEST)
 	$(BUILD)/test_link
 	$(BUILD)/test_vectors
 	$(BUILD)/pixel_safety
+	$(LEGACY_TEST)
 
-asan: $(BUILD)/test_link_asan $(BUILD)/test_vectors_asan $(BUILD)/pixel_safety_asan
+asan: $(BUILD)/test_link_asan $(BUILD)/test_vectors_asan $(BUILD)/pixel_safety_asan $(LEGACY_ASAN)
 	$(BUILD)/test_link_asan
 	$(BUILD)/test_vectors_asan
 	$(BUILD)/pixel_safety_asan
+	$(LEGACY_ASAN)
 
 cxx: $(BUILD)/cxx_check
 	$(BUILD)/cxx_check
@@ -81,3 +85,10 @@ $(BUILD)/pixel_safety: tests/pixel_safety.c rewrite_link.h | $(BUILD)
 
 $(BUILD)/pixel_safety_asan: tests/pixel_safety.c rewrite_link.h | $(BUILD)
 	$(CC) $(CSTD) $(WARN) -O1 -g $(SAN) tests/pixel_safety.c -o $@ $(LDLIBS)
+
+# Compile the old deployment-target path and simulate an absent preadv entry point.
+$(BUILD)/pixel_macos_legacy: tests/pixel_macos_legacy.c rewrite_link.h | $(BUILD)
+	$(CC) $(CSTD) $(WARN) $(OPT) -mmacosx-version-min=10.15 tests/pixel_macos_legacy.c -o $@ $(LDLIBS)
+
+$(BUILD)/pixel_macos_legacy_asan: tests/pixel_macos_legacy.c rewrite_link.h | $(BUILD)
+	$(CC) $(CSTD) $(WARN) -O1 -g $(SAN) -mmacosx-version-min=10.15 tests/pixel_macos_legacy.c -o $@ $(LDLIBS)

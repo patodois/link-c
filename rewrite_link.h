@@ -3544,7 +3544,16 @@ struct rbl_pixel_writer {
     uint64_t frame_no;
 };
 
-#if defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__))
+/* Below macOS 11 the preadv import can be null: select scalar I/O at compile time. */
+#if defined(__APPLE__)
+#include <AvailabilityMacros.h>
+#endif
+#if (defined(__APPLE__) && MAC_OS_X_VERSION_MIN_REQUIRED >= 110000) || (defined(__linux__) && !defined(__ANDROID__))
+#define RBLI_PIXEL_VECTOR_IO 1
+#else
+#define RBLI_PIXEL_VECTOR_IO 0
+#endif
+#if RBLI_PIXEL_VECTOR_IO
 #include <sys/uio.h>
 static int rbli_vector_rows(rbl_pixel_reader* r, size_t at, size_t stride, size_t row, uint32_t height, void* dst) {
     size_t gap=stride-row; uint32_t start;
@@ -3597,7 +3606,7 @@ static int rbli_pixel_copy(const rbl_pixel_reader* r, size_t at, void* dst, size
 static int rbli_pixel_rows(rbl_pixel_reader* r, size_t at, size_t stride, size_t row, uint32_t height, void* dst) {
     uint32_t y;
     if (stride == row) return rbli_pixel_copy(r, at, dst, row * height);
-#if defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__))
+#if RBLI_PIXEL_VECTOR_IO
     /* Reading wide padding costs more than the saved calls; keep those rows separate. */
     if (stride <= 16u * 1024u && height>1 && (size_t)(height-1)*stride+row <= row*height*4u) return rbli_vector_rows(r,at,stride,row,height,dst);
 #endif
