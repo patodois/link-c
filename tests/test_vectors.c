@@ -55,7 +55,7 @@
  *     scripts/sync-link-vectors.sh <path of this repository>
  * (it copies the directory and prints "VECTORS_DIGEST = <hex>"), paste the hex here, then run `make test`
  * and re-check KNOWN_DISAGREEMENTS. */
-#define VECTORS_DIGEST "547bf4ff7f5369d3ba2d18eca05a2530b8daff0d3e6517471bc5ac0185122d13"
+#define VECTORS_DIGEST "07cf745d30318403b1808b974f050914db061d78a4351683e0c20fc0284ceab8"
 
 /* Vectors this implementation fails: { id, why }, the list ends with { NULL, NULL }. */
 static const struct { const char* id; const char* why; } KNOWN_DISAGREEMENTS[] = {
@@ -1440,6 +1440,13 @@ static int check_info(rbl_pixel_reader* rd, const JV* info) {
 }
 
 static int check_pixel_reader(const JV* c) {
+    const JV* channels=jv_get(c,"channels");
+    if(channels) {
+        size_t channel;for(channel=0;channel<channels->n;channel++) {
+            int result=check_pixel_reader(&channels->v[channel]);if(result) return result;
+        }
+        return 0;
+    }
     Temp t;
     char path[1300], open_path[1300], fixture[1300];
     const char* pk = jv_get(c, "path_kind") ? jstr(c, "path_kind") : NULL;
