@@ -20,6 +20,17 @@ static int checked_fstat(int fd, struct stat* st) {
     }
     return rc;
 }
+static off_t truncate_at = -1;
+static unsigned copy_calls;
+static ssize_t checked_pread(int fd, void* dst, size_t len, off_t offset) {
+    copy_calls++;
+    if (offset == truncate_at) {
+        truncate_at = -1;
+        if (ftruncate(truncate_fd, offset + 64)) abort();
+    }
+    return pread(fd,dst,len,offset);
+}
+#define pread checked_pread
 #define fstat checked_fstat
 #define REWRITE_LINK_IMPLEMENTATION
 #include "../rewrite_link.h"
@@ -43,6 +54,41 @@ static int child(const char* mode) {
     rbl_pixel_reader_close(r); close(truncate_fd); rbl_pixel_writer_close(w);
     return 0;
 }
+static int plane_test(int depth) {
+    rbl_pixel_writer* w; rbl_pixel_reader* r;
+    uint8_t px[128]={7}; float d[32]={2}; uint64_t no; int rc;
+    rbl_frame f={1,0,0,8,4}; rbl_pixel_info info;
+    if(rbl_pixel_writer_create_temp("plane",16,8,1,1,&w)) return 2;
+    if(rbl_pixel_writer_write(w,px,sizeof px,d,32,8,4,0,1,&no)) return 3;
+    if(rbl_pixel_reader_open(rbl_pixel_writer_path(w),&r)) return 4;
+    rbl_pixel_reader_info(r,&info);
+    truncate_fd=open(rbl_pixel_writer_path(w),O_WRONLY);
+    truncate_at=(off_t)(64+(depth?info.depth_offset:64));
+    rc=rbl_pixel_reader_read_frame(r,&f,px,sizeof px,depth?d:NULL,depth?32:0,NULL);
+    close(truncate_fd); truncate_fd=-1; rbl_pixel_reader_close(r);rbl_pixel_writer_close(w);
+    printf("partial %s: rc=%d expected=%d\n",depth?"depth":"colour",rc,RBL_MISS_GONE);
+    return rc==RBL_MISS_GONE?0:1;
+}
+static int order_test(void) {
+    rbl_pixel_writer *a,*b; rbl_pixel_reader *ar,*br;
+    uint8_t px[24]={7}; float depth[6]={2}; uint64_t no; int i,fail=0;
+    rbl_frame old={5,2,0,2,2},first={1,1,0,3,2}; rbl_pixel_stats before,after; rbl_pixel_frame info;
+    if(rbl_pixel_writer_create_temp("two-a",2,2,3,0,&a)||rbl_pixel_writer_create_temp("two-b",3,2,3,1,&b)) return 2;
+    for(i=0;i<5;i++) if(rbl_pixel_writer_write(a,px,16,NULL,0,2,2,0,1,&no)) return 3;
+    if(rbl_pixel_writer_write(b,px,24,depth,6,3,2,0,1,&no)) return 4;
+    if(rbl_pixel_reader_open(rbl_pixel_writer_path(a),&ar)||rbl_pixel_reader_open(rbl_pixel_writer_path(b),&br)) return 5;
+    fail |= rbl_pixel_reader_read_latest(ar,&old,px,sizeof px,NULL,0,NULL)!=RBL_OK;
+    fail |= rbl_pixel_reader_read_latest(br,&old,px,sizeof px,NULL,0,NULL)==RBL_OK;
+    fail |= rbl_pixel_reader_read_latest(br,&first,px,sizeof px,NULL,0,&info)!=RBL_OK || info.has_depth;
+    fail |= rbl_pixel_reader_read_latest(br,&first,px,sizeof px,NULL,0,NULL)==RBL_OK;
+    rbl_pixel_reader_stats(br,&before);
+    fail |= before.stale!=1;
+    fail |= rbl_pixel_reader_read_latest(br,NULL,px,sizeof px,NULL,0,NULL)!=RBL_ERR_ARGS;
+    rbl_pixel_reader_stats(br,&after);fail |= memcmp(&before,&after,sizeof before)!=0;
+    rbl_pixel_reader_close(ar);rbl_pixel_reader_close(br);rbl_pixel_writer_close(a);rbl_pixel_writer_close(b);
+    printf("two-file presentation order: %s\n",fail?"FAIL":"ok");return fail;
+}
+
 static double now_ms(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1000.0+t.tv_nsec/1000000.0; }
 static int compare(const void* a,const void* b) { double x=*(const double*)a,y=*(const double*)b; return (x>y)-(x<y); }
 static int bench(void) {
@@ -74,7 +120,11 @@ static int bench(void) {
 }
 int main(int argc,char** argv) {
     if(argc>1 && !strcmp(argv[1],"bench")) return bench();
+    if(argc>1 && !strcmp(argv[1],"colour")) return plane_test(0);
+    if(argc>1 && !strcmp(argv[1],"depth")) return plane_test(1);
+    if(argc>1 && !strcmp(argv[1],"order")) return order_test();
     if(argc>1) return child(argv[1]);
+    if(plane_test(0)||plane_test(1)||order_test()) return 1;
     {
         const char* modes[]={"open","read"}; int i,failed=0;
         for(i=0;i<2;i++) {

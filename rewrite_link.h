@@ -1,4 +1,4 @@
-/* rewrite_link.h - the rewrite-bridge passthrough link protocol v1 (revision 6), C99, single header.
+/* rewrite_link.h - the rewrite-bridge passthrough link protocol v1 (revision 7), C99, single header.
  *
  * https://github.com/patodois/link-c  -  MIT OR Apache-2.0
  *
@@ -576,9 +576,10 @@ typedef struct rbl_pixel_frame {
 } rbl_pixel_frame;
 
 /* Diagnostics: why reads returned a miss. */
-typedef struct rbl_pixel_stats { uint64_t busy, other_frame, overwritten, gone; } rbl_pixel_stats;
+typedef struct rbl_pixel_stats { uint64_t busy, other_frame, overwritten, gone, stale; } rbl_pixel_stats;
 
-/* Maps a pixel file read-only after the checks of revision 5: the path must be absolute and name a
+/* Opens a pixel file with bounded positional I/O on Unix, or a protected Windows map,
+ * after the checks of revision 7: the path must be absolute and name a
  * regular file (a symlink, FIFO, device, directory or socket is refused; on Unix the file is
  * checked before and after it is opened, with O_NONBLOCK, and both must be the same device and
  * inode), width and height 1..16384, at most 2^26 pixels, stride == width * 4, slots 1..16, every
@@ -597,7 +598,8 @@ RBLDEF int rbl_pixel_reader_is_gone(const rbl_pixel_reader* r);
  * height is 0 or above the file's, or when the slot header's width or height is 0, above the file's or
  * not equal to the datagram's. It does not require slot == frame % slots. Then it copies frame
  * f->frame out of the slot with the seqlock. rgba must hold the slot's width * height * 4 bytes (the
- * file's width * height * 4 is always enough); depth may be NULL (not wanted) or hold width * height
+ * file's width * height * 4 is always enough). Buffers are valid only on RBL_OK; a miss may
+ * leave partial or previous bytes. depth may be NULL (not wanted) or hold width * height
  * floats. info (may be NULL) gets the slot's header. Returns RBL_OK, an RBL_MISS_* (skip the frame),
  * RBL_ERR_TOO_BIG if a buffer is too small, or RBL_ERR_ARGS. */
 RBLDEF int rbl_pixel_reader_read_frame(rbl_pixel_reader* r, const rbl_frame* f, uint8_t* rgba, size_t rgba_cap,
@@ -2790,7 +2792,7 @@ static int rbli_on_line(rbl_link* l, char* line, size_t len, uint64_t now, char*
         return 0;
     }
     case RBL_CTL_FRAME_CHANNEL: {
-        /* A new pixel file numbers its frames from 1 again (CONTRACT.md 8). */
+        /* Forward the announcement; presentation state belongs to the replacement reader. */
         char* path = rbli_arena_str(l, m.u.frame_channel.path);
         rbl_event* e;
         if (!path) { l->stats.dropped++; return 0; }
@@ -3658,6 +3660,7 @@ RBLDEF int rbl_pixel_reader_has_depth(const rbl_pixel_reader* r) { return r->inf
 RBLDEF void rbl_pixel_reader_stats(const rbl_pixel_reader* r, rbl_pixel_stats* out) { *out = r->st; }
 
 RBLDEF int rbl_pixel_reader_is_gone(const rbl_pixel_reader* r) {
+    if (r->st.gone) return 1;
 #if RBLI_WINDOWS
     LARGE_INTEGER sz;
     if (!GetFileSizeEx(r->file, &sz)) return 1;
@@ -3683,7 +3686,7 @@ static int rbli_pixel_read(rbl_pixel_reader* r, uint64_t frame, uint32_t slot, i
     if (slot >= r->info.slots) return RBL_MISS_OTHER_FRAME;
     if (frame == 0) { r->st.other_frame++; return RBL_MISS_OTHER_FRAME; } /* never delivered (contract 9.6, reader step 0) */
     if (have_size && (dw < 1 || dh < 1 || dw > r->info.width || dh > r->info.height)) { r->st.other_frame++; return RBL_MISS_OTHER_FRAME; }
-    if (rbl_pixel_reader_is_gone(r)) { r->st.gone++; return RBL_MISS_GONE; } /* the next access to a shrunk file would fault */
+    if (rbl_pixel_reader_is_gone(r)) { r->st.gone++; return RBL_MISS_GONE; } /* early rejection; bounded reads also catch later truncation */
     base = RBLI_FILE_HDR + (size_t)slot * (size_t)r->info.slot_size;
 #if RBLI_WINDOWS
     l1 = rbli_ld_acquire(r->map + base);
@@ -3749,7 +3752,7 @@ RBLDEF int rbl_pixel_reader_read_latest(rbl_pixel_reader* r, const rbl_frame* f,
                                         float* depth, size_t depth_cap, rbl_pixel_frame* info) {
     int rc;
     if (!r || !f) return RBL_ERR_ARGS;
-    if (f->frame <= r->newest) { r->st.other_frame++; return RBL_MISS_OTHER_FRAME; }
+    if (f->frame != 0 && f->frame <= r->newest) { r->st.stale++; r->st.other_frame++; return RBL_MISS_OTHER_FRAME; }
     rc = rbl_pixel_reader_read_frame(r, f, rgba, rgba_cap, depth, depth_cap, info);
     if (rc == RBL_OK) r->newest = f->frame;
     return rc;
