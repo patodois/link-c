@@ -3,3 +3,6 @@ build/
 *.obj
 *.exe
 *.dSYM/
+
+# Isolated dependencies for workflow regression tests.
+.workflow-tests/
