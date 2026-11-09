@@ -1,5 +1,7 @@
 # link-c
 
+link-c is a single-header C99 library for C and C++ game-plugin developers to connect games as hosts or guests through the rewrite-bridge passthrough link protocol.
+
 Native macOS builds require macOS 11.0 or newer. Set `MACOSX_DEPLOYMENT_TARGET=11.0`
 when compiling native libraries or executables; positional vector I/O uses the system
 `preadv` introduced in macOS 11.0. When compiling this header with a deployment target below
