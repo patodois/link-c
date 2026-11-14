@@ -2254,14 +2254,23 @@ static rbl_event* rbli_ev_push(rbl_link* l, rbl_event_type t) {
  * poll always has its place. */
 static int rbli_room(const rbl_link* l) { return l->ev && l->ev_n + 1 < l->ev_cap; }
 
+/* The text of an end event. It can quote a peer that never authenticated (a bye before the hello), so every byte below
+ * 0x20 and 0x7F becomes a space: an application that logs the text gets one line and no terminal escapes. */
+static void rbli_copy_reason(rbl_reason* out, const char* reason) {
+    char* p;
+    rbli_copy_text(out->text, sizeof out->text, reason, strlen(reason));
+    for (p = out->text; *p; p++)
+        if ((unsigned char)*p < 0x20 || *p == 0x7F) *p = ' ';
+}
+
 static void rbli_report_end(rbl_link* l, int was_live, const char* reason) {
     rbl_event_type t = was_live ? RBL_EV_LOST : RBL_EV_HANDSHAKE_FAILED;
     rbl_event* e = rbli_ev_push(l, t);
     if (e) {
-        rbli_copy_text(e->u.lost.text, sizeof e->u.lost.text, reason, strlen(reason));
+        rbli_copy_reason(&e->u.lost, reason);
     } else {
         l->pending_type = (int)t;
-        rbli_copy_text(l->pending.text, sizeof l->pending.text, reason, strlen(reason));
+        rbli_copy_reason(&l->pending, reason);
     }
 }
 

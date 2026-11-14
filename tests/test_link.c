@@ -1008,6 +1008,27 @@ TEST(hello_with_wrong_role_protocol_or_garbage_gets_bye) {
     }
 }
 
+TEST(a_peers_reason_reaches_the_event_without_control_characters) {
+    rbl_config h;
+    rbl_link* host;
+    Col c;
+    Raw r;
+    int ok;
+    size_t i;
+    memset(&c, 0, sizeof c);
+    rbl_config_init(&h, "H"); h.control_port = 0; h.token = "a-token-the-peer-does-not-have";
+    REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
+    REQUIRE(raw_open(&r, rbl_link_control_port(host)));
+    /* a bye before any hello is honoured, so a peer without the token chooses this text */
+    raw_send(&r, "{\"type\":\"bye\",\"reason\":\"x\\u001b[2J\\r\\n[host] connected: trusted\\tguest\\u007f.\"}\n");
+    WAIT_UNTIL(2000, (col_poll(host, &c), raw_pump(&r)), c.hsfail > 0, ok);
+    REQUIRE(ok);
+    CHECK_STR(c.hsfail_reason, "peer said bye: x [2J  [host] connected: trusted guest .");
+    for (i = 0; c.hsfail_reason[i]; i++) CHECK((unsigned char)c.hsfail_reason[i] >= 0x20 && (unsigned char)c.hsfail_reason[i] != 0x7F);
+    raw_close(&r);
+    rbl_link_close(host);
+}
+
 TEST(watchdog_loses_a_silent_guest) {
     rbl_config h;
     rbl_link* host;
@@ -2791,6 +2812,7 @@ int main(void) {
     RUN(handshake_state_flow_and_clean_bye);
     RUN(second_connection_gets_bye_busy);
     RUN(hello_with_wrong_role_protocol_or_garbage_gets_bye);
+    RUN(a_peers_reason_reaches_the_event_without_control_characters);
     RUN(watchdog_loses_a_silent_guest);
     RUN(bye_is_delivered_and_the_close_is_clean_while_the_closer_has_unread_data);
     RUN(close_returns_within_the_linger_even_if_the_peer_never_closes);
