@@ -2101,6 +2101,8 @@ typedef struct rbli_ctl {
     size_t wlen, wcap;
     const char* fatal; /* a static reason once the stream is unusable (line too long, not UTF-8) */
     const char* end;   /* a static reason once the peer closed or the read failed; applies after the last line */
+    const char* werr;  /* a static reason once a write failed: nothing more is written, and the session ends at the next
+                          rbli_poll_control, after the lines already received (a bye among them decides, contract 6.1) */
 } rbli_ctl;
 
 /* A control connection being closed gracefully (CONTRACT.md 6.1): flush the last bytes (usually a
@@ -2312,13 +2314,15 @@ static void rbli_ctl_free(rbli_ctl* c) {
     c->sock = RBLI_BAD_SOCK;
 }
 
+static const char rbli_write_failed[] = "control write failed";
+
 /* Writes as much as the socket takes without blocking; returns an error reason or NULL. */
 static const char* rbli_flush(rbli_sock s, char* wbuf, size_t* wlen) {
     size_t off = 0;
     while (off < *wlen) {
         int n = rbli_tcp_send(s, wbuf + off, *wlen - off);
         if (n == -1) break;
-        if (n == -2) return "control write failed";
+        if (n == -2) return rbli_write_failed;
         if (n == 0) break;
         off += (size_t)n;
     }
@@ -2330,7 +2334,15 @@ static const char* rbli_flush(rbli_sock s, char* wbuf, size_t* wlen) {
     return NULL;
 }
 
-static const char* rbli_ctl_flush(rbli_ctl* c) { return rbli_flush(c->sock, c->wbuf, &c->wlen); }
+/* Flushes the queue. A write error is kept in c->werr and the unsent bytes are dropped; from then on nothing is written
+ * and this returns c->werr. Returns the 1 MiB reason, c->werr or NULL. */
+static const char* rbli_ctl_flush(rbli_ctl* c) {
+    const char* err = NULL;
+    if (!c->werr) err = rbli_flush(c->sock, c->wbuf, &c->wlen);
+    if (err == rbli_write_failed) c->werr = err;
+    if (c->werr) { c->wlen = 0; return c->werr; }
+    return err;
+}
 
 /* Reads what is there. A closed or failed stream is remembered in c->end and applies after the
  * last complete line has been handled. */
@@ -2450,6 +2462,7 @@ static void rbli_retire_ctl(rbl_link* l, const char* bye, uint64_t now) {
     rbli_sock s = c->sock;
     char* wbuf = c->wbuf;
     size_t wlen = c->wlen, wcap = c->wcap;
+    if (c->werr) bye = NULL; /* a stream that failed a write gets no bye; its unsent bytes were dropped (wlen is 0) */
     c->wbuf = NULL;
     if (c->rbuf) REWRITE_LINK_FREE(c->rbuf);
     memset(c, 0, sizeof *c);
@@ -2505,8 +2518,11 @@ static void rbli_end(rbl_link* l, const char* reason, int bye) {
 
 /* ---- sending ---- */
 
+/* A live session that can still be sent to: after a control write error nothing is sent until the next poll ends it. */
+static int rbli_live(const rbl_link* l) { return l->state == RBLI_LIVE && !l->ctl.werr; }
+
 static int rbli_live_header(rbl_link* l, rbl_header* h) {
-    if (l->state != RBLI_LIVE) return RBL_ERR_NOT_CONNECTED;
+    if (!rbli_live(l)) return RBL_ERR_NOT_CONNECTED;
     memset(h, 0, sizeof *h);
     h->magic = RBL_MAGIC;
     h->version = (uint16_t)l->peer.protocol;
@@ -2535,13 +2551,13 @@ static void rbli_send_heartbeat(rbl_link* l) {
 static int rbli_send_control(rbl_link* l, const rbl_control* m) {
     int r;
     const char* err;
-    if (l->state != RBLI_LIVE) return RBL_ERR_NOT_CONNECTED;
+    if (!rbli_live(l)) return RBL_ERR_NOT_CONNECTED;
     r = rbli_ctl_queue(&l->ctl, m);
     if (r != RBL_OK) return r;
     l->stats.lines_sent++;
     err = rbli_ctl_flush(&l->ctl);
     if (err) {
-        rbli_end(l, err, 0);
+        if (!l->ctl.werr) rbli_end(l, err, 0); /* the 1 MiB rule ends the session now; a write error at the next poll */
         return RBL_ERR_NOT_CONNECTED;
     }
     return RBL_OK;
@@ -2739,6 +2755,7 @@ static int rbli_on_line(rbl_link* l, char* line, size_t len, uint64_t now, char*
         snprintf(reason, rcap, "peer said bye: %s", t);
         return 1;
     }
+    if (l->ctl.werr && l->state == RBLI_HANDSHAKE) { snprintf(reason, rcap, "%s", l->ctl.werr); return 1; } /* no session */
     if (l->state == RBLI_HANDSHAKE) {
         if (m.type != RBL_CTL_HELLO) { snprintf(reason, rcap, "expected hello"); *bye = 1; return 1; }
         if (rbli_on_hello(l, &m, now, reason, rcap) != 0) { *bye = 1; return 1; }
@@ -2822,27 +2839,38 @@ static void rbli_poll_control(rbl_link* l, uint64_t now) {
     if (l->state != RBLI_HANDSHAKE && l->state != RBLI_LIVE) return;
     c = &l->ctl;
     err = rbli_ctl_flush(c);
-    if (err) { rbli_end(l, err, 0); return; }
+    if (err && !c->werr) { rbli_end(l, err, 0); return; } /* the 1 MiB rule */
+    /* After a write error the lines already received are still handled, and the session ends in this poll: with the
+     * peer's bye if one is among them (contract 6.1), else with the write error. Nothing is written any more. */
     rbli_ctl_fill(c);
     for (;;) {
         char* line;
         size_t len;
         char reason[200];
         int bye, r;
-        if (!rbli_room(l)) return; /* the caller's array is full: the rest waits for the next poll */
+        if (!rbli_room(l)) { /* the caller's array is full: the rest waits for the next poll */
+            if (c->werr) break;
+            return;
+        }
         r = rbli_ctl_next_line(c, &line, &len);
-        if (r < 0) { rbli_end(l, c->fatal, 1); return; } /* a protocol error: tell the peer (CONTRACT 8, 6.1) */
+        if (r < 0) { /* a protocol error: tell the peer (CONTRACT 8, 6.1) */
+            if (c->werr) rbli_end(l, c->werr, 0);
+            else rbli_end(l, c->fatal, 1);
+            return;
+        }
         if (r == 0) break;
         l->stats.lines_received++;
         if (rbli_on_line(l, line, len, now, reason, sizeof reason, &bye) != 0) {
-            rbli_end(l, reason, bye);
+            if (c->werr && bye) rbli_end(l, c->werr, 0); /* not the peer's bye */
+            else rbli_end(l, reason, bye);
             return;
         }
         if (l->state == RBLI_IDLE) return;
     }
     /* A bye was handled above (it ends the session first), so an end of stream or a reset that
      * follows a bye never reaches this point as a failure. */
-    if (c->end) rbli_end(l, c->end, 0);
+    if (c->werr) rbli_end(l, c->werr, 0);
+    else if (c->end) rbli_end(l, c->end, 0);
 }
 
 /* ---- polling: datagrams ---- */
@@ -3250,7 +3278,7 @@ RBLDEF int rbl_link_send_camera(rbl_link* l, const rbl_camera* c, uint32_t* seq_
 RBLDEF int rbl_link_send_poses(rbl_link* l, const rbl_pose* poses, size_t count) {
     size_t i;
     if (!l || (count && !poses)) return RBL_ERR_ARGS;
-    if (l->state != RBLI_LIVE) return RBL_ERR_NOT_CONNECTED;
+    if (!rbli_live(l)) return RBL_ERR_NOT_CONNECTED;
     for (i = 0; i < count; i += RBL_MAX_POSES) {
         rbl_header h;
         size_t n = count - i < RBL_MAX_POSES ? count - i : RBL_MAX_POSES;
@@ -3268,7 +3296,7 @@ RBLDEF int rbl_link_send_collision(rbl_link* l, const float center[3], float rad
     rbl_triangle* copy = NULL;
     size_t chunks;
     if (!l || !center || (count && !tris)) return RBL_ERR_ARGS;
-    if (l->state != RBLI_LIVE) return RBL_ERR_NOT_CONNECTED;
+    if (!rbli_live(l)) return RBL_ERR_NOT_CONNECTED;
     /* a snapshot has at most 4096 chunks (contract 9.5): refuse before anything is copied or allocated */
     if (count > (size_t)RBL_MAX_COLLISION_TRIANGLES) return RBL_ERR_TOO_BIG;
     chunks = rbl_wire_chunk_count(count);
@@ -3387,9 +3415,9 @@ RBLDEF void rbl_link_close(rbl_link* l) {
 RBLDEF rbl_role rbl_link_role(const rbl_link* l) { return l->role; }
 RBLDEF uint16_t rbl_link_control_port(const rbl_link* l) { return l->control_port; }
 RBLDEF uint16_t rbl_link_udp_port(const rbl_link* l) { return l->udp_port; }
-RBLDEF int rbl_link_is_connected(const rbl_link* l) { return l->state == RBLI_LIVE; }
+RBLDEF int rbl_link_is_connected(const rbl_link* l) { return rbli_live(l); }
 RBLDEF int rbl_link_peer(const rbl_link* l, rbl_peer_info* out) {
-    if (l->state != RBLI_LIVE) return 0;
+    if (!rbli_live(l)) return 0;
     *out = l->peer;
     return 1;
 }

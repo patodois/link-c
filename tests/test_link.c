@@ -1072,6 +1072,61 @@ TEST(bye_is_delivered_and_the_close_is_clean_while_the_closer_has_unread_data) {
     rbl_link_close(host);
 }
 
+/* CONTRACT.md 6.1: a received bye decides how the session ended, also when a control write to the closed connection
+ * fails before the host has read it. The raw peer is closed before the host writes, so the outcome does not depend on
+ * timing: the host writes until a write fails, then one poll ends the session. */
+TEST(a_bye_that_arrived_wins_over_a_later_control_write_error) {
+    /* Windows discards what a socket has received but not read once a reset arrives (CONTRACT.md 6.1), so the bye of
+     * pass 0 is gone there after the write that drew the reset: Windows runs pass 1 only. */
+    int pass, first = RBLI_WINDOWS ? 1 : 0;
+    for (pass = first; pass < 2; pass++) { /* 0: the peer says bye and closes; 1: it closes without a bye */
+        rbl_config h;
+        rbl_link* host;
+        Col c;
+        Raw r;
+        rbl_camera cam;
+        rbl_stats before;
+        char line[400];
+        int rc = RBL_OK;
+        uint64_t end;
+        memset(&c, 0, sizeof c);
+        memset(&cam, 0, sizeof cam);
+        rbl_config_init(&h, "H"); h.control_port = 0;
+        REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
+        REQUIRE(raw_open(&r, rbl_link_control_port(host)));
+        hello_line(line, sizeof line, "guest", 1, 1, r.udp_port, 250);
+        raw_send(&r, line);
+        REQUIRE(raw_wait_line(&r, host, &c, 2000, line, sizeof line)); /* the host's hello: the session is live */
+        REQUIRE(rbl_link_is_connected(host));
+        if (pass == 0) raw_send(&r, "{\"type\":\"bye\",\"reason\":\"guest shutting down\"}\n");
+        rbli_sock_close(r.tcp); /* gone before the host writes; the host has not polled since */
+        r.tcp = RBLI_BAD_SOCK;
+        end = rbli_mono_ms() + 2000;
+        while (rbli_mono_ms() < end) { /* the first write draws a reset, a later one fails */
+            rc = rbl_link_spawn(host, 1, "P", "a", NULL);
+            if (rc != RBL_OK) break;
+            rbli_sleep_ms(1);
+        }
+        REQUIRE(rc == RBL_ERR_NOT_CONNECTED);
+        /* from the failed write on nothing more is sent, on either channel */
+        before = stats_of(host);
+        CHECK(!rbl_link_is_connected(host));
+        CHECK_EQ(rbl_link_despawn(host, 1), RBL_ERR_NOT_CONNECTED);
+        CHECK_EQ(rbl_link_send_camera(host, &cam, NULL), RBL_ERR_NOT_CONNECTED);
+        CHECK_EQ(stats_of(host).lines_sent, before.lines_sent);
+        CHECK_EQ(stats_of(host).datagrams_sent, before.datagrams_sent);
+        col_poll(host, &c); /* the next poll ends the session */
+        CHECK_EQ(c.lost, 1);
+        if (pass == 0) CHECK(strstr(c.lost_reason, "peer said bye: guest shutting down") != NULL);
+        else CHECK(strstr(c.lost_reason, "control write failed") != NULL);
+        if (c.lost != 1 || !strstr(c.lost_reason, pass == 0 ? "peer said bye" : "control write failed"))
+            printf("     pass %d: %d lost, reason \"%s\"\n", pass, c.lost, c.lost_reason);
+        CHECK(!rbl_link_is_connected(host));
+        raw_close(&r);
+        rbl_link_close(host);
+    }
+}
+
 TEST(close_returns_within_the_linger_even_if_the_peer_never_closes) {
     rbl_config h;
     rbl_link* host;
@@ -2739,6 +2794,7 @@ int main(void) {
     RUN(watchdog_loses_a_silent_guest);
     RUN(bye_is_delivered_and_the_close_is_clean_while_the_closer_has_unread_data);
     RUN(close_returns_within_the_linger_even_if_the_peer_never_closes);
+    RUN(a_bye_that_arrived_wins_over_a_later_control_write_error);
     RUN(datagrams_from_another_address_are_dropped);
     RUN(peer_address_must_be_127_0_0_1_and_the_announced_port);
     RUN(pixel_file_colour_only_round_trip);
