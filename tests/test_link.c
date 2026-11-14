@@ -1198,6 +1198,40 @@ TEST(datagrams_from_another_address_are_dropped) {
     pair_close(&p);
 }
 
+TEST(a_datagram_of_another_version_from_the_peer_is_malformed_not_foreign) {
+    rbl_config h;
+    rbl_link* host;
+    Col c;
+    Raw r;
+    char line[400];
+    rbl_control hello;
+    const char* why;
+    uint8_t b[64];
+    rbl_header hd;
+    rbl_stats before;
+    int n, ok;
+    memset(&c, 0, sizeof c);
+    rbl_config_init(&h, "H"); h.control_port = 0;
+    REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
+    REQUIRE(raw_open(&r, rbl_link_control_port(host)));
+    hello_line(line, sizeof line, "guest", 1, 1, r.udp_port, 250);
+    raw_send(&r, line);
+    REQUIRE(raw_wait_line(&r, host, &c, 2000, line, sizeof line));
+    REQUIRE(parse_line(line, &hello, &why) == RBL_OK);
+    hd = mk_header(hello.u.hello.session, 1, rbl_now_us());
+    n = rbl_wire_encode_heartbeat(&hd, b, sizeof b);
+    REQUIRE(n == RBL_HEADER_LEN);
+    rbli_put16(b + 4, 2); /* the right session from the peer's address, another version */
+    before = stats_of(host);
+    REQUIRE(rbli_udp_send(r.udp, b, (size_t)n, rbl_link_udp_port(host)));
+    WAIT_UNTIL(1000, col_poll(host, &c), stats_of(host).malformed > before.malformed, ok);
+    CHECK(ok);
+    CHECK_EQ(stats_of(host).foreign, before.foreign);
+    CHECK_EQ(stats_of(host).datagrams_received, before.datagrams_received);
+    raw_close(&r);
+    rbl_link_close(host);
+}
+
 TEST(peer_address_must_be_127_0_0_1_and_the_announced_port) {
     CHECK(rbli_is_peer_addr(0x7F000001u, 5000, 5000));
     CHECK(!rbli_is_peer_addr(0x7F000001u, 5001, 5000));
@@ -2818,6 +2852,7 @@ int main(void) {
     RUN(close_returns_within_the_linger_even_if_the_peer_never_closes);
     RUN(a_bye_that_arrived_wins_over_a_later_control_write_error);
     RUN(datagrams_from_another_address_are_dropped);
+    RUN(a_datagram_of_another_version_from_the_peer_is_malformed_not_foreign);
     RUN(peer_address_must_be_127_0_0_1_and_the_announced_port);
     RUN(pixel_file_colour_only_round_trip);
     RUN(pixel_reader_checks_the_frame_datagrams_size_against_the_file_and_the_slot);

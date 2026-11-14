@@ -492,7 +492,7 @@ typedef struct rbl_stats {
     uint64_t datagrams_sent, datagrams_received;
     uint64_t malformed;      /* datagrams that failed validation */
     uint64_t stale;          /* late or out-of-order state that was dropped */
-    uint64_t foreign;        /* datagrams from another address, session or version */
+    uint64_t foreign;        /* datagrams from another address or session (one of another version is malformed) */
     uint64_t send_dropped;   /* datagrams the OS would not take */
     uint64_t lines_sent, lines_received;
     uint64_t unknown_entity; /* pose records for an entity the peer never spawned */
@@ -3018,7 +3018,7 @@ static void rbli_poll_udp(rbl_link* l, uint64_t now) {
             l->stats.malformed++;
             continue;
         }
-        if (rbli_get32(l->rx + 8) != l->peer.session || rbli_get16(l->rx + 4) != l->peer.protocol) {
+        if (rbli_get32(l->rx + 8) != l->peer.session) { /* a version other than RBL_VERSION is malformed, above */
             l->stats.foreign++;
             continue;
         }
