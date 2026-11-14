@@ -1527,7 +1527,7 @@ static int rbli_jdigit(const rbli_jp* p) { return p->i < p->n && p->s[p->i] >= '
 
 /* number = [-] (0 | 1-9 digits) [. digits] [(e|E) [+|-] digits]  (RFC 8259) */
 static int rbli_jnumber(rbli_jp* p, rbli_jf* cap) {
-    size_t start = p->i, int_start, int_end, frac_start = 0, frac_end = 0;
+    size_t int_start, int_end, frac_start = 0, frac_end = 0;
     int neg = 0, integer = 1;
     long exp10 = 0;
     int exp_neg = 0;
@@ -1612,7 +1612,6 @@ static int rbli_jnumber(rbli_jp* p, rbli_jf* cap) {
             if (!over) { cap->kind = 2; cap->u = v; }
         }
     }
-    (void)start;
     return 0;
 }
 
