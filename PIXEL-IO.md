@@ -53,6 +53,10 @@ in C# returns null and increments SkippedAllocation without advancing order. Thi
 cannot prevent an operating system from terminating a process under memory pressure;
 other allocation policies remain those of each language and API.
 
+The C writer sizes its file once with ftruncate and maps it, so on Unix the file is sparse: disk space is taken when
+a page is first written, and a full disk or temp file system at that moment can end the writing process with SIGBUS
+inside the write. It does not preallocate.
+
 Windows keeps a read-only map and the existing atomic lock observations: an active section
 prevents ordinary truncation. Creation also checks that the actual mapping/file extent did
 not shrink before protection took effect. Rust and managed ports read the header using

@@ -108,14 +108,14 @@ standing in for the game's frame loop. `examples/demo.c` is the longer one, the 
 
 | | |
 |---|---|
-| `rbl_link_host(&cfg, &link)`, `rbl_link_guest(&cfg, &link)` | Create one side. `rbl_config_init(&cfg, "My Game")` fills in the defaults (port 47800, heartbeat 250 ms, timeout 2000 ms). |
+| `rbl_link_host(&cfg, &link)`, `rbl_link_guest(&cfg, &link)` | Create one side. `rbl_config_init(&cfg, "My Game")` fills in the defaults (port 47800, heartbeat 250 ms, timeout 2000 ms); a `heartbeat_ms` or `timeout_ms` of 0 also means the default. |
 | `rbl_link_poll(link, events, cap)` | **Never blocks.** Does the handshake, reads both channels, sends heartbeats and at most 32 collision chunks, checks the watchdog, and writes what happened into **your** array of `rbl_event`. Returns the count. Call it every frame. |
 | `rbl_link_send_camera`, `rbl_link_send_poses`, `rbl_link_send_collision`, `rbl_link_send_frame` | State datagrams. `send_collision` copies the triangles and queues the chunks (paced, a newer snapshot replaces the queued one); the others send at once. `send_camera` returns the `seq` a guest quotes in `rbl_frame.camera_seq`. |
 | `rbl_link_spawn`, `rbl_link_despawn`, `rbl_link_set_focus`, `rbl_link_announce_frames` | Control messages. |
 | `rbl_link_disconnect(link, reason)`, `rbl_link_close(link)` | `bye`, half-close, drain (CONTRACT 6.1). `disconnect` does not block; `close` may block for up to about 250 ms, so call it at shutdown. |
 | `rbl_link_is_connected`, `rbl_link_peer`, `rbl_link_focus`, `rbl_link_stats`, `rbl_link_control_port`, `rbl_link_udp_port` | Queries. `rbl_stats` has `malformed`, `stale`, `foreign`, `unknown_entity`, `spawn_ignored`, `send_dropped`, `datagrams_sent/received`, `lines_sent/received`, `dropped`; `foreign` counts datagrams from another address or session, and one of another protocol version counts as `malformed`. |
 | `rbl_pixel_writer_create[_temp]`, `rbl_pixel_writer_write`, `rbl_link_announce_writer`, `rbl_pixel_writer_close` | The sending side of the pixel file: created exclusively, colour and optional linear depth, seqlock. |
-| `rbl_pixel_reader_open`, `rbl_pixel_reader_read_latest` (raw `read_frame` / `read`), `rbl_pixel_reader_close` | The receiving side: every revision 5 check, copies a slot into your buffers with the seqlock. |
+| `rbl_pixel_reader_open`, `rbl_pixel_reader_read_latest`, `rbl_pixel_reader_close` | The receiving side: every revision 5 check, copies a slot into your buffers with the seqlock. Present frames with `read_latest`. Two raw calls copy without ordering: `read_frame`, for inspection and re-reading, and `read`, which is **not conformant** to contract section 9.6 (it cannot compare the datagram's size) and is kept only so that old programs build. |
 | `rbl_wire_*`, `rbl_control_parse`, `rbl_control_format` | The codecs, public for tools and tests. |
 | `cfg.token`, `cfg.endpoint_file`, `rbl_generate_token`, `rbl_token_equal`, `rbl_endpoint_write`, `rbl_endpoint_read`, `rbl_endpoint_remove` | Authentication, contract revision 6 (below). |
 | `rbl_camera_look_at`, `rbl_pose_identity`, `rbl_quat_*` | Small helpers in the link's conventions (right-handed, +Y up, +Z front). |
@@ -143,6 +143,11 @@ checks the slot header's against the file's alone and is **not conformant** to c
 `RBL_MISS_BUSY`, `OTHER_FRAME` or `OVERWRITTEN` when the writer got there first (skip the frame), and
 `RBL_MISS_GONE` when the file shrank or positional I/O failed (drop the reader and cached image). Reprojection and compositing with
 depth (CONTRACT 9.7) are the host engine's job; this library does not do them.
+
+The writer sizes its file once and maps it (up to 16 slots of about 512 MiB each). On Unix the file is sparse: disk
+space is taken when a page is first written, not when the file is created. If the disk or the temp file system is full
+at that moment, the system cannot back the page and can end the writing process with `SIGBUS` inside
+`rbl_pixel_writer_write`. Keep the temp directory on a file system with room for the file's size.
 
 ## Authentication: the token and the endpoint file (contract revision 7)
 
@@ -187,8 +192,10 @@ On Windows the file has no mode bits: put it under `%LOCALAPPDATA%` and the per-
 
 ## Contract revision 5
 
-All of it is implemented and each rule has a test that fails without it (the tests were also run against
-deliberately broken copies of the header to check that they notice):
+All of it is implemented, and every rule below has a test except the request for a 4 MiB UDP receive buffer (the
+system may grant less, and no test can observe the request). Some of the tests were also run against copies of the
+header with the rule removed, to check that they notice: among them the length check before each read and the same
+device and inode check of the pixel reader.
 
 - paced collision, at most 32 chunks per `rbl_link_poll`, a newer snapshot replaces queued chunks; a 4 MiB
   UDP receive buffer is requested;
@@ -224,8 +231,11 @@ process, and they are normally written in C++; the same goes for other native pl
 Unreal modules). This is what I know of that and what follows from it for this library; **I have not built or
 run it inside any of them.**
 
-1. Put `#define REWRITE_LINK_IMPLEMENTATION` before `#include "rewrite_link.h"` in exactly one `.cpp` file of the
-   plugin (the header compiles as C++; the checks here used clang++ on macOS). Everywhere else include it plainly.
+1. Put the implementation in a `.cpp` (or `.c`) file of its own: `#define REWRITE_LINK_IMPLEMENTATION`, then
+   `#include "rewrite_link.h"`, with nothing included before them and no other code in the file, as `examples/impl.c`
+   does. The implementation defines POSIX feature macros (`_POSIX_C_SOURCE`, `_FILE_OFFSET_BITS`, ...) that must come
+   before the first system header and stay in force for the rest of that file. Everywhere else include the header
+   plainly. (The header compiles as C++; the checks here used clang++ on macOS.)
 2. Link `ws2_32` and `bcrypt` (MSVC picks them up from the `#pragma comment` in the header; MinGW needs
    `-lws2_32 -lbcrypt`). The library calls `WSAStartup` and `WSACleanup` itself for each link, which Windows
    counts, so it does not disturb a game that uses Winsock too.
@@ -331,8 +341,9 @@ tests/interop.sh
   the revision 6 Windows code (`BCryptGenRandom`, `CreateFileW` with `CREATE_NEW`, `MoveFileExW`, `GetFileType`); `bcrypt` is
   linked by the CMake target and by the `#pragma comment` for MSVC. A few vector cases skip themselves on Windows (file modes,
   symlinks, a pixel file shortened while mapped). **Never run on Windows:** the two-process demo (`tests/interop.sh`, which CI
-  runs on Linux and macOS only), the cross-language interop, a game process, and Wine. GCC on Linux has not been tried, and
-  neither has GCC or MinGW on Windows.
+  runs on Linux and macOS only), the cross-language interop, a game process, and Wine. On `ubuntu-latest` the CI workflow
+  runs `make`, `make test`, `make asan`, `make cxx` and `tests/interop.sh c` with the runner's `cc`, which is GCC; GCC
+  and MinGW on Windows have not been tried.
 - Winsock: each link calls `WSAStartup` and, when it is closed, `WSACleanup`; Windows counts them. If your own code uses sockets, hold your own `WSAStartup`
   reference (any game that uses Winsock does), or the last `rbl_link_close()` shuts Winsock down under your sockets.
 - Big-endian hosts: the datagram and JSON codecs are byte-order clean; the pixel file path swaps the lock word and

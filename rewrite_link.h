@@ -431,8 +431,8 @@ typedef struct rbl_config {
     const char* game;            /* this side's game, sent in hello (copied, at most 255 bytes used) */
     uint16_t control_port;       /* host: TCP port to listen on (0 = any free port); guest: the host's port */
     uint16_t udp_port;           /* this side's UDP port (0 = any free port), announced in hello */
-    uint32_t heartbeat_ms;       /* heartbeat period; clamped to 10..10000 */
-    uint32_t timeout_ms;         /* own watchdog timeout; the effective one is max(this, 4 * peer heartbeat) */
+    uint32_t heartbeat_ms;       /* heartbeat period; 0 = the default (250), otherwise clamped to 10..10000 */
+    uint32_t timeout_ms;         /* own watchdog timeout, 0 = the default (2000); the effective one is max(this, 4 * peer heartbeat) */
     uint32_t reconnect_ms;       /* guest: how often to retry connecting while no host answers */
     uint32_t max_collision_triangles; /* receiver limit on one assembled snapshot (a snapshot above it is dropped); default and
                                          maximum RBL_MAX_COLLISION_TRIANGLES (925696), 0 = the default, a larger value is clamped */
@@ -630,7 +630,8 @@ RBLDEF void rbl_pixel_reader_close(rbl_pixel_reader* r);
 /* Creates a pixel file for writing: exclusively (an existing path gives RBL_ERR_EXISTS), sized
  * once and never resized, mode 0600, mapped read-write. width and height are 1..16384 with at
  * most 2^26 pixels, slots 1..16 (3 is recommended). A relative path is made absolute against the
- * current directory. */
+ * current directory. The file is sparse: on Unix a disk that is full when a page is first written
+ * can end the process with SIGBUS in rbl_pixel_writer_write (nothing is preallocated). */
 RBLDEF int rbl_pixel_writer_create(const char* path, uint32_t width, uint32_t height, uint32_t slots,
                                    int with_depth, rbl_pixel_writer** out);
 /* The same in the temp directory, named rewrite-bridge-<pid>-<tag>-<random>.frames. */

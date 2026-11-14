@@ -19,6 +19,16 @@ make cxx
 RBL_DEMO=build/demo tests/interop.sh c
 ```
 
+What they cost and touch:
+
+- `make test` and `make asan` each take about a minute, most of it sessions that wait on timers.
+- The tests write into the temp directory (`$TMPDIR`) and into the working directory (a relative-path pixel file named
+  with the process id); `make` builds into `build/`, which Git ignores.
+- The vector runner needs sparse files of up to 1 GiB; `RBL_VECTORS_SKIP_LARGE=1` skips those cases.
+- On macOS `make test` also builds `pixel_macos_legacy` with `-mmacosx-version-min=10.15`.
+- The tests use ports the system picks; `tests/interop.sh c` needs ports 47900 and 47901 free (`RBL_BASE_PORT`
+  moves them) and removes its log directory when every check passes.
+
 Windows CI uses:
 
 ```sh
@@ -45,7 +55,8 @@ python3 -m venv .workflow-tests
 
 ## Project rules
 
-- Define `REWRITE_LINK_IMPLEMENTATION` in exactly one C or C++ translation unit.
+- Define `REWRITE_LINK_IMPLEMENTATION` in exactly one C or C++ translation unit, a file of its own with nothing
+  included before the header (like `examples/impl.c`): the implementation sets POSIX feature macros for that file.
 - Follow `docs/CONTRACT.md` in rewrite-bridge; the other language implementations share its vectors.
 - Bind and connect only to `127.0.0.1`; the library creates no threads or global state.
 - Present frames with the ordered reader and drop old pixel-channel state when the session changes.
