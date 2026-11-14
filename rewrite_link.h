@@ -3147,9 +3147,20 @@ static void rbli_link_destroy(rbl_link* l) {
     REWRITE_LINK_FREE(l);
 }
 
+/* Destroys a link that could not be created and returns rc, keeping the OS error of the failure for rbl_os_error(). */
+static int rbli_create_failed(rbl_link* l, int rc) {
+    int saved = rbli_os_errno();
+    rbli_link_destroy(l);
+#if RBLI_WINDOWS
+    WSASetLastError(saved);
+#else
+    errno = saved;
+#endif
+    return rc;
+}
+
 static int rbli_link_create(const rbl_config* cfg, rbl_role role, rbl_link** out) {
     rbl_link* l;
-    int saved;
     if (!out) return RBL_ERR_ARGS;
     *out = NULL;
     if (!cfg) return RBL_ERR_ARGS;
@@ -3214,16 +3225,8 @@ static int rbli_link_create(const rbl_config* cfg, rbl_role role, rbl_link** out
     } else {
         l->control_port = cfg->control_port;
     }
-    if (l->udp == RBLI_BAD_SOCK || (role == RBL_ROLE_HOST && l->listener == RBLI_BAD_SOCK)) {
-        saved = rbli_os_errno();
-        rbli_link_destroy(l);
-#if RBLI_WINDOWS
-        WSASetLastError(saved);
-#else
-        errno = saved;
-#endif
-        return RBL_ERR_IO;
-    }
+    if (l->udp == RBLI_BAD_SOCK || (role == RBL_ROLE_HOST && l->listener == RBLI_BAD_SOCK))
+        return rbli_create_failed(l, RBL_ERR_IO);
     if (role == RBL_ROLE_HOST && l->endpoint_path) {
         /* contract 6.2: only now, with the port bound, and with the port that was bound. A token that was not configured is made
          * here, from the OS generator. If anything fails the host is not created (the listener is closed with it). */
@@ -3241,16 +3244,7 @@ static int rbli_link_create(const rbl_config* cfg, rbl_role role, rbl_link** out
             rc = RBL_OK;
         }
         if (rc == RBL_OK) rc = rbl_endpoint_write(l->endpoint_path, l->control_port, l->token);
-        if (rc != RBL_OK) {
-            saved = rbli_os_errno();
-            rbli_link_destroy(l);
-#if RBLI_WINDOWS
-            WSASetLastError(saved);
-#else
-            errno = saved;
-#endif
-            return rc;
-        }
+        if (rc != RBL_OK) return rbli_create_failed(l, rc);
         l->endpoint_written = 1;
     }
     *out = l;
