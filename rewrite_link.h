@@ -17,6 +17,10 @@
  *   MinGW; MSVC picks both up by itself), and keep <windows.h> out of the file that holds the
  *   implementation unless you include it with WIN32_LEAN_AND_MEAN.
  *
+ *   Paths are UTF-8 on every platform: on Windows every path argument (endpoint_file, pixel file paths) and every path
+ *   result (rbl_temp_dir, rbl_pixel_writer_path, the frame_channel path) is UTF-8, converted to and from the wide (W)
+ *   API calls, never the ANSI code page.
+ *
  *   The header compiles as C99, C11 and C++ (extern "C"). Nothing here needs a C runtime beyond
  *   <stdlib.h>, <string.h>, <stdio.h> (snprintf) and <math.h>.
  *
@@ -643,7 +647,7 @@ RBLDEF int rbl_link_announce_writer(rbl_link* link, const rbl_pixel_writer* w);
 /* Unmaps, closes and deletes the file. w may be NULL. */
 RBLDEF void rbl_pixel_writer_close(rbl_pixel_writer* w);
 
-/* The temp directory, with a trailing separator, written to out; returns the length or <0. */
+/* The temp directory, with a trailing separator, written to out (UTF-8, also on Windows); returns the length or <0. */
 RBLDEF int rbl_temp_dir(char* out, size_t cap);
 /* Whether path is absolute under the Unix rules (starts with '/') or the Windows rules (a drive
  * letter, a colon and a separator, or two leading separators). The reader applies the rules of
@@ -3559,6 +3563,15 @@ static wchar_t* rbli_widen(const char* s) {
     if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, -1, w, n) <= 0) { REWRITE_LINK_FREE(w); return NULL; }
     return w;
 }
+/* The reverse: n UTF-16 units (n > 0) as UTF-8 and a NUL in out[cap]. Returns the length, or RBL_ERR_TOO_BIG. */
+static int rbli_narrow(const wchar_t* w, int n, char* out, size_t cap) {
+    int m;
+    if (cap < 2 || cap - 1 > 0x7FFFFFFF) return RBL_ERR_TOO_BIG;
+    m = WideCharToMultiByte(CP_UTF8, 0, w, n, out, (int)(cap - 1), NULL, NULL);
+    if (m <= 0) return RBL_ERR_TOO_BIG;
+    out[m] = 0;
+    return m;
+}
 #endif
 
 struct rbl_pixel_reader {
@@ -3904,9 +3917,10 @@ RBLDEF void rbl_pixel_reader_close(rbl_pixel_reader* r) {
 
 RBLDEF int rbl_temp_dir(char* out, size_t cap) {
 #if RBLI_WINDOWS
-    DWORD n = GetTempPathA((DWORD)(cap > 0xFFFF ? 0xFFFF : cap), out);
-    if (n == 0 || n >= cap) return RBL_ERR_TOO_BIG;
-    return (int)n;
+    wchar_t w[1024];
+    DWORD n = GetTempPathW((DWORD)(sizeof w / sizeof w[0]), w);
+    if (n == 0 || n >= sizeof w / sizeof w[0]) return RBL_ERR_TOO_BIG;
+    return rbli_narrow(w, (int)n, out, cap);
 #else
     const char* t = getenv("TMPDIR");
     size_t n;
@@ -3949,9 +3963,12 @@ RBLDEF int rbl_pixel_writer_create(const char* path, uint32_t width, uint32_t he
         if (w->path) memcpy(w->path, path, plen + 1);
     } else {
 #if RBLI_WINDOWS
-        char cwd[1024];
-        DWORD n = GetCurrentDirectoryA(sizeof cwd, cwd);
-        if (n > 0 && n < sizeof cwd) {
+        wchar_t wcwd[1024];
+        char cwd[4096];
+        DWORD wn = GetCurrentDirectoryW((DWORD)(sizeof wcwd / sizeof wcwd[0]), wcwd);
+        int m = wn > 0 && wn < sizeof wcwd / sizeof wcwd[0] ? rbli_narrow(wcwd, (int)wn, cwd, sizeof cwd) : -1;
+        if (m > 0) {
+            size_t n = (size_t)m;
             w->path = (char*)REWRITE_LINK_MALLOC(n + plen + 2);
             if (w->path) { memcpy(w->path, cwd, n); w->path[n] = '\\'; memcpy(w->path + n + 1, path, plen + 1); }
         }

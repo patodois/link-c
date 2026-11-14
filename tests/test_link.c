@@ -1605,6 +1605,34 @@ TEST(review_writer_limits_and_create_new) {
     rbl_pixel_writer_close(w);
 }
 
+/* Paths are UTF-8 on every platform. Windows CI runs this test again with TMP and TEMP set to a directory whose name is
+ * not ASCII; it uses only the library's own path calls, so nothing here goes through the ANSI code page. */
+TEST(temp_directory_paths_are_utf8_and_round_trip) {
+    char dir[1024];
+    int n;
+    rbl_pixel_writer* w;
+    rbl_pixel_reader* r;
+    rbl_frame f;
+    rbl_pixel_frame info;
+    uint8_t px[4 * 4 * 4], got[4 * 4 * 4];
+    uint64_t frame = 0;
+    n = rbl_temp_dir(dir, sizeof dir);
+    REQUIRE(n > 0);
+    CHECK(rbli_utf8_valid((const uint8_t*)dir, (size_t)n));
+    REQUIRE(rbl_pixel_writer_create_temp("utf8", 4, 4, 2, 0, &w) == RBL_OK);
+    CHECK(strncmp(rbl_pixel_writer_path(w), dir, (size_t)n) == 0);
+    CHECK(rbli_utf8_valid((const uint8_t*)rbl_pixel_writer_path(w), strlen(rbl_pixel_writer_path(w))));
+    memset(px, 0x3C, sizeof px);
+    REQUIRE(rbl_pixel_writer_write(w, px, sizeof px, NULL, 0, 4, 4, 7, 1, &frame) == RBL_OK);
+    REQUIRE(rbl_pixel_reader_open(rbl_pixel_writer_path(w), &r) == RBL_OK);
+    memset(&f, 0, sizeof f);
+    f.frame = frame; f.slot = (uint32_t)(frame % 2); f.width = 4; f.height = 4;
+    CHECK_EQ(rbl_pixel_reader_read_latest(r, &f, got, sizeof got, NULL, 0, &info), RBL_OK);
+    CHECK(memcmp(px, got, sizeof px) == 0);
+    rbl_pixel_reader_close(r);
+    rbl_pixel_writer_close(w);
+}
+
 TEST(review_writer_validates_and_never_leaves_the_lock_odd) {
     char path[512];
     rbl_pixel_writer* w;
@@ -2862,6 +2890,7 @@ int main(void) {
     RUN(pixel_file_a_truncated_copy_is_refused);
     RUN(review_pixel_header_limits_and_overflow);
     RUN(review_writer_limits_and_create_new);
+    RUN(temp_directory_paths_are_utf8_and_round_trip);
     RUN(review_writer_validates_and_never_leaves_the_lock_odd);
 #if !RBLI_WINDOWS
     RUN(review_symlink_directory_and_fifo_are_refused);

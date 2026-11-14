@@ -337,6 +337,9 @@ tests/interop.sh
   reference (any game that uses Winsock does), or the last `rbl_link_close()` shuts Winsock down under your sockets.
 - Big-endian hosts: the datagram and JSON codecs are byte-order clean; the pixel file path swaps the lock word and
   depth floats but has not been run.
+- Paths are UTF-8 on every platform. On Windows every path argument and result (`endpoint_file`, pixel file paths,
+  `rbl_temp_dir`, `rbl_pixel_writer_path`, the `frame_channel` path) is UTF-8, and the library converts it for the
+  wide (`W`) Windows calls; a path in the ANSI code page (as `getenv` returns it) is not one.
 - Strings that you pass in must be UTF-8 (invalid sequences are replaced by U+FFFD). The configured `game`
   is copied at a UTF-8 boundary using at most 255 bytes; a peer's displayed game name uses at most 127.
   Disconnect and reported failure `reason` strings use at most 199 bytes, also cut at a UTF-8 boundary.
