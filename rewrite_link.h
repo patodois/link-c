@@ -2839,7 +2839,7 @@ static int rbli_on_line(rbl_link* l, char* line, size_t len, uint64_t now, char*
         if (!path) { l->stats.dropped++; return 0; }
         e = rbli_ev_push(l, RBL_EV_FRAME_CHANNEL);
         if (e) {
-            e->u.frame_channel.path = strlen(path) == m.u.frame_channel.path.len ? path : NULL;
+            e->u.frame_channel.path = path; /* holds no NUL: a "\u0000" escape or a raw NUL fails the parse */
             e->u.frame_channel.width = m.u.frame_channel.width;
             e->u.frame_channel.height = m.u.frame_channel.height;
             e->u.frame_channel.slots = m.u.frame_channel.slots;
