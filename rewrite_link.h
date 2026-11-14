@@ -4209,7 +4209,7 @@ RBLDEF int rbl_endpoint_write(const char* path, uint16_t port, const char* token
     char text[2048];
     char* tmp;
     int len, rc = RBL_ERR_IO;
-    if (!path || !path[0] || !token || port == 0 || rbli_check_token(token) != RBL_OK || !token[0]) return RBL_ERR_ARGS;
+    if (!path || !path[0] || port == 0 || !token || rbli_check_token(token) != RBL_OK) return RBL_ERR_ARGS; /* also "" */
     len = rbli_endpoint_text(text, sizeof text, port, token);
     if (len < 0) { rbli_wipe(text, sizeof text); return len == RBL_ERR_NOMEM ? RBL_ERR_NOMEM : RBL_ERR_ARGS; }
     tmp = rbli_endpoint_tmp_path(path);
