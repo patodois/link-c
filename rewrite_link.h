@@ -3052,9 +3052,18 @@ RBLDEF void rbl_config_init(rbl_config* cfg, const char* game) {
 
 RBLDEF int rbl_os_error(void) { return rbli_os_errno(); }
 
-/* Host: deletes the endpoint file it wrote (best effort, once). */
+/* Host: deletes the endpoint file it wrote (best effort, once), but only while the file is still this host's: one that a
+ * guest would accept, with this link's control port and token. Another host on the same path may have replaced it since,
+ * and a file that cannot be read or holds anything else is left where it is. */
 static void rbli_endpoint_drop(rbl_link* l) {
-    if (l->endpoint_written && l->endpoint_path) rbl_endpoint_remove(l->endpoint_path);
+    if (l->endpoint_written && l->endpoint_path) {
+        uint16_t port = 0;
+        char tok[RBL_MAX_TOKEN + 1];
+        if (rbl_endpoint_read(l->endpoint_path, &port, tok) == RBL_OK && port == l->control_port &&
+            rbl_token_equal(tok, strlen(tok), l->token, l->token_len))
+            rbl_endpoint_remove(l->endpoint_path);
+        rbli_wipe(tok, sizeof tok);
+    }
     l->endpoint_written = 0;
 }
 

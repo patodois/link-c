@@ -2424,6 +2424,63 @@ TEST(a_host_with_a_configured_token_writes_that_token_to_the_file) {
     ep_rmdir(dir);
 }
 
+static int ep_write_raw(const char* path, const char* text) {
+    FILE* f = fopen(path, "wb"); /* an existing file keeps its mode */
+    int ok;
+    if (!f) return 0;
+    ok = fputs(text, f) >= 0;
+    return fclose(f) == 0 && ok;
+}
+
+TEST(a_closing_host_leaves_a_newer_hosts_endpoint_file_in_place) {
+    char dir[1100], path[1300], tok[257];
+    uint16_t port = 0;
+    rbl_config h;
+    rbl_link *older = NULL, *newer = NULL;
+    REQUIRE(ep_dir(dir, sizeof dir, 7));
+    ep_path(path, sizeof path, dir, "game.json");
+    rbl_config_init(&h, "Host"); h.control_port = 0; h.endpoint_file = path;
+    REQUIRE(rbl_link_host(&h, &older) == RBL_OK);
+    REQUIRE(rbl_link_host(&h, &newer) == RBL_OK); /* a second instance on the same path replaces the file */
+    rbl_link_close(older);
+    CHECK_EQ(rbl_endpoint_read(path, &port, tok), RBL_OK); /* the newer host's file is still there for a guest */
+    CHECK_EQ(port, rbl_link_control_port(newer));
+    rbl_link_close(newer);
+    CHECK_EQ(ep_count_entries(dir), 0); /* and the newer host removes its own file */
+    ep_rmdir(dir);
+}
+
+TEST(a_closing_host_leaves_an_endpoint_file_that_is_not_its_own) {
+    char dir[1100], path[1300], tok[257];
+    uint16_t port = 0;
+    rbl_config h;
+    rbl_link* host = NULL;
+    REQUIRE(ep_dir(dir, sizeof dir, 8));
+    ep_path(path, sizeof path, dir, "game.json");
+    rbl_config_init(&h, "Host"); h.control_port = 0; h.endpoint_file = path;
+    /* the same port with another token */
+    REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
+    REQUIRE(rbl_endpoint_write(path, rbl_link_control_port(host), "another-hosts-token") == RBL_OK);
+    rbl_link_close(host);
+    CHECK_EQ(rbl_endpoint_read(path, &port, tok), RBL_OK);
+    CHECK_STR(tok, "another-hosts-token");
+    /* contents that are not an endpoint file */
+    REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
+    REQUIRE(ep_write_raw(path, "not an endpoint file\n"));
+    rbl_link_close(host);
+    CHECK(exists(path));
+#if !RBLI_WINDOWS
+    /* the host's own port and token in a file a guest would refuse (others may read it) */
+    REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
+    REQUIRE(chmod(path, 0644) == 0);
+    rbl_link_close(host);
+    CHECK(exists(path));
+#endif
+    ep_rm(path);
+    CHECK_EQ(ep_count_entries(dir), 0);
+    ep_rmdir(dir);
+}
+
 TEST(a_host_whose_endpoint_file_cannot_be_written_is_not_created) {
     char dir[1100], path[1300], deep[1400];
     rbl_config h, h2;
@@ -2723,6 +2780,8 @@ int main(void) {
     RUN(config_defaults_and_bad_tokens);
     RUN(a_host_with_an_endpoint_file_writes_it_after_binding_and_removes_it_on_close);
     RUN(a_host_with_a_configured_token_writes_that_token_to_the_file);
+    RUN(a_closing_host_leaves_a_newer_hosts_endpoint_file_in_place);
+    RUN(a_closing_host_leaves_an_endpoint_file_that_is_not_its_own);
     RUN(a_host_whose_endpoint_file_cannot_be_written_is_not_created);
     RUN(a_guest_without_an_endpoint_file_waits_quietly_and_reads_it_again_for_every_attempt);
     RUN(a_guest_with_a_wrong_token_is_unauthorized_and_no_secret_shows);
