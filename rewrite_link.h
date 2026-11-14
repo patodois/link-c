@@ -893,7 +893,7 @@ static void rbli_sleep_ms(unsigned ms) {
 }
 static int rbli_os_errno(void) { return errno; }
 static int rbli_would_block(int e) { return e == EWOULDBLOCK || e == EAGAIN || e == EINPROGRESS || e == EINTR; }
-static int rbli_in_progress(int e) { return e == EINPROGRESS || e == EWOULDBLOCK || e == EAGAIN || e == EINTR; }
+#define rbli_in_progress(e) rbli_would_block(e) /* the same set here; on Windows they differ by WSAEINTR */
 static int rbli_net_up(void) { return 0; }
 static void rbli_net_down(void) {}
 static void rbli_sock_close(rbli_sock s) { close(s); }
