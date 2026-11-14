@@ -2474,6 +2474,19 @@ static void rbli_retire(rbl_link* l, rbli_sock sock, char* wbuf, size_t wlen, si
     l->closing[l->nclosing++] = c;
 }
 
+/* Makes progress on every closing connection and forgets the ones that are done. */
+static void rbli_closing_pump_all(rbl_link* l, uint64_t now) {
+    int i;
+    for (i = 0; i < l->nclosing;) {
+        if (rbli_closing_pump(&l->closing[i], now)) {
+            i++;
+        } else {
+            memmove(&l->closing[i], &l->closing[i + 1], sizeof(rbli_closing) * (size_t)(l->nclosing - i - 1));
+            l->nclosing--;
+        }
+    }
+}
+
 static void rbli_retire_ctl(rbl_link* l, const char* bye, uint64_t now) {
     rbli_ctl* c = &l->ctl;
     rbli_sock s = c->sock;
@@ -3249,7 +3262,6 @@ RBLDEF int rbl_link_guest(const rbl_config* cfg, rbl_link** out) { return rbli_l
 
 RBLDEF int rbl_link_poll(rbl_link* l, rbl_event* events, size_t cap) {
     uint64_t now;
-    int i;
     size_t n;
     if (!l || !events || cap < RBL_MIN_EVENTS) return RBL_ERR_ARGS;
     rbli_arena_reset(l, 1);
@@ -3262,14 +3274,7 @@ RBLDEF int rbl_link_poll(rbl_link* l, rbl_event* events, size_t cap) {
         l->pending_type = 0;
     }
     now = rbli_mono_ms();
-    for (i = 0; i < l->nclosing;) {
-        if (rbli_closing_pump(&l->closing[i], now)) {
-            i++;
-        } else {
-            memmove(&l->closing[i], &l->closing[i + 1], sizeof(rbli_closing) * (size_t)(l->nclosing - i - 1));
-            l->nclosing--;
-        }
-    }
+    rbli_closing_pump_all(l, now);
     rbli_poll_connect(l, now);
     rbli_poll_control(l, now);
     rbli_poll_udp(l, now);
@@ -3405,7 +3410,6 @@ RBLDEF void rbl_link_disconnect(rbl_link* l, const char* reason) {
 
 RBLDEF void rbl_link_close(rbl_link* l) {
     uint64_t now, stop;
-    int i;
     if (!l) return;
     rbli_endpoint_drop(l); /* first: from here on a guest must not be sent to a host that is closing */
     now = rbli_mono_ms();
@@ -3417,17 +3421,8 @@ RBLDEF void rbl_link_close(rbl_link* l) {
     l->state = RBLI_IDLE;
     stop = now + RBL_LINGER_MS + 50;
     while (l->nclosing > 0 && rbli_mono_ms() < stop) {
-        uint64_t t;
         rbli_sleep_ms(2);
-        t = rbli_mono_ms();
-        for (i = 0; i < l->nclosing;) {
-            if (rbli_closing_pump(&l->closing[i], t)) {
-                i++;
-            } else {
-                memmove(&l->closing[i], &l->closing[i + 1], sizeof(rbli_closing) * (size_t)(l->nclosing - i - 1));
-                l->nclosing--;
-            }
-        }
+        rbli_closing_pump_all(l, rbli_mono_ms());
     }
     rbli_link_destroy(l);
 }
