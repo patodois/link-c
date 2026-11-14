@@ -1671,10 +1671,12 @@ TEST(review_writer_limits_and_create_new) {
     CHECK(!exists(path));
     /* a relative path is announced as an absolute one */
 #if !RBLI_WINDOWS
-    REQUIRE(rbl_pixel_writer_create("link-c-relative-test.frames", 4, 4, 1, 0, &w) == RBL_OK);
-    CHECK(rbl_pixel_writer_path(w)[0] == '/');
-    CHECK(strstr(rbl_pixel_writer_path(w), "link-c-relative-test.frames") != NULL);
-    rbl_pixel_writer_close(w);
+    {   char rel[64]; /* in the working directory, named with the process id so two runs in one tree do not collide */
+        snprintf(rel, sizeof rel, "link-c-relative-test-%u.frames", rbli_pid());
+        REQUIRE(rbl_pixel_writer_create(rel, 4, 4, 1, 0, &w) == RBL_OK);
+        CHECK(rbl_pixel_writer_path(w)[0] == '/');
+        CHECK(strstr(rbl_pixel_writer_path(w), rel) != NULL);
+        rbl_pixel_writer_close(w); }
 #endif
     /* temp files carry the process id and a random part */
     REQUIRE(rbl_pixel_writer_create_temp("tag/with:odd chars", 4, 4, 1, 0, &w) == RBL_OK);
@@ -2333,7 +2335,7 @@ TEST(a_snapshot_above_the_receivers_limit_is_dropped) {
     pair_close(&p);
 }
 
-TEST(fuzz_a_live_host_with_junk_datagrams_and_lines) {
+TEST(fuzz_a_live_host_with_junk_datagrams) {
     rbl_config h;
     rbl_link* host;
     Col c;
@@ -2366,7 +2368,7 @@ TEST(fuzz_a_live_host_with_junk_datagrams_and_lines) {
     vlen[0] = (size_t)rbl_wire_encode_poses(&hd, ps, 2, valid[0], sizeof valid[0]);
     vlen[1] = (size_t)rbl_wire_encode_camera(&hd, &cam, valid[1], sizeof valid[1]);
     vlen[2] = (size_t)rbl_wire_encode_frame(&hd, &fr, valid[2], sizeof valid[2]);
-    raw_send(&r, "{\"type\":\"spawn\",\"entity\":1,\"provider\":\"P\",\"asset\":\"a\"}\n");
+    raw_send(&r, "{\"type\":\"spawn\",\"entity\":1,\"provider\":\"P\",\"asset\":\"a\"}\n"); /* one valid line, so poses have an entity */
     for (i = 0; i < 30000; i++) {
         size_t len;
         int kind = (int)(rnd() % 4);
@@ -2757,7 +2759,6 @@ TEST(a_guest_without_an_endpoint_file_waits_quietly_and_reads_it_again_for_every
     rbl_link *host = NULL, *guest = NULL;
     Col hc, gc;
     int ok;
-    uint16_t first_port;
     char first_tok[257], tok[257];
     uint16_t port;
     REQUIRE(ep_dir(dir, sizeof dir, 6));
@@ -2773,9 +2774,9 @@ TEST(a_guest_without_an_endpoint_file_waits_quietly_and_reads_it_again_for_every
     REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
     WAIT_UNTIL(4000, (col_poll(host, &hc), col_poll(guest, &gc)), rbl_link_is_connected(host) && rbl_link_is_connected(guest), ok);
     REQUIRE(ok);
-    first_port = rbl_link_control_port(host);
     REQUIRE(rbl_endpoint_read(path, &port, first_tok) == RBL_OK);
-    /* the host restarts with another port and token; the file is read again before the guest's next attempt */
+    /* the host restarts with another token (the system may hand out the same port again); the file is read again before
+     * the guest's next attempt, or the guest would send the old token and be refused */
     rbl_link_close(host);
     host = NULL;
     WAIT_UNTIL(3000, col_poll(guest, &gc), !rbl_link_is_connected(guest), ok);
@@ -2783,7 +2784,6 @@ TEST(a_guest_without_an_endpoint_file_waits_quietly_and_reads_it_again_for_every
     REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
     REQUIRE(rbl_endpoint_read(path, &port, tok) == RBL_OK);
     CHECK(strcmp(tok, first_tok) != 0);
-    (void)first_port;
     WAIT_UNTIL(5000, (col_poll(host, &hc), col_poll(guest, &gc)), rbl_link_is_connected(host) && rbl_link_is_connected(guest), ok);
     CHECK(ok);
     rbl_link_close(guest);
@@ -3019,7 +3019,7 @@ int main(void) {
     RUN(a_control_line_with_a_nul_escape_is_a_protocol_error);
     RUN(poll_with_a_small_array_loses_nothing);
     RUN(a_snapshot_above_the_receivers_limit_is_dropped);
-    RUN(fuzz_a_live_host_with_junk_datagrams_and_lines);
+    RUN(fuzz_a_live_host_with_junk_datagrams);
     RUN(token_equal_is_the_contracts_comparison);
     RUN(generate_token_gives_64_lowercase_hex_digits_and_a_new_one_each_time);
     RUN(endpoint_file_round_trip_replace_and_no_temp_file_left);

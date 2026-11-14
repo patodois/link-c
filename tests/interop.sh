@@ -4,7 +4,7 @@
 #   RBL_DEMO=build/demo \
 #   RBL_FAKE_HOST=.../fake_host RBL_FAKE_GUEST=.../fake_guest \      (rewrite-bridge: cargo build --release --features link --examples)
 #   RBL_JAVA_CP=.../link-java/build/classes/java/main \               (optional; RBL_JAVA is the java command, default "java")
-#   RBL_LOG_DIR=/some/dir \                                           (default: a new temp directory)
+#   RBL_LOG_DIR=/some/dir \                                           (default: a new temp directory, removed if every check passes)
 #   tests/interop.sh [peer ...]                                       (peers to test against: rust java c; default: all that are configured)
 #
 # Each pair runs twice: "basic" (guest with a pixel file and depth, the host's ground collision patch,
@@ -13,7 +13,7 @@
 set -u
 DEMO="${RBL_DEMO:-build/demo}"
 JAVA="${RBL_JAVA:-java}"
-LOG_DIR="${RBL_LOG_DIR:-$(mktemp -d)}"
+if [ -n "${RBL_LOG_DIR:-}" ]; then LOG_DIR=$RBL_LOG_DIR; OWN_LOG_DIR=0; else LOG_DIR=$(mktemp -d); OWN_LOG_DIR=1; fi
 SECS="${RBL_SECONDS:-5}"
 PORT="${RBL_BASE_PORT:-47900}"
 mkdir -p "$LOG_DIR"
@@ -80,6 +80,12 @@ run_case() { # run_case HOST_PEER GUEST_PEER SCENARIO
   check_not "no unknown entity poses"            "$hl" 'unknown_entity [1-9]'
 }
 
+usage_exit() { # usage_exit MESSAGE: exit 2; the log directory goes too if this script made it and nothing failed
+  echo "$1"
+  if [ "$OWN_LOG_DIR" = 1 ] && [ "$fails" -eq 0 ]; then rm -rf "$LOG_DIR"; else echo "logs in $LOG_DIR"; fi
+  exit 2
+}
+
 peers=("$@")
 if [ ${#peers[@]} -eq 0 ]; then
   peers=(c)
@@ -89,9 +95,9 @@ fi
 for p in "${peers[@]}"; do
   case "$p" in
     c)    ;;
-    rust) [ $have_rust = 1 ] || { echo "rust peers need RBL_FAKE_HOST and RBL_FAKE_GUEST"; exit 2; } ;;
-    java) [ $have_java = 1 ] || { echo "java peers need RBL_JAVA_CP"; exit 2; } ;;
-    *)    echo "unknown peer $p"; exit 2 ;;
+    rust) [ $have_rust = 1 ] || usage_exit "rust peers need RBL_FAKE_HOST and RBL_FAKE_GUEST" ;;
+    java) [ $have_java = 1 ] || usage_exit "java peers need RBL_JAVA_CP" ;;
+    *)    usage_exit "unknown peer $p" ;;
   esac
   for scenario in basic big; do
     if [ "$p" = c ]; then
@@ -104,4 +110,9 @@ for p in "${peers[@]}"; do
 done
 
 echo
-if [ "$fails" -eq 0 ]; then echo "interop: all checks passed (logs in $LOG_DIR)"; else echo "interop: $fails check(s) FAILED (logs in $LOG_DIR)"; exit 1; fi
+if [ "$fails" -eq 0 ]; then
+  if [ "$OWN_LOG_DIR" = 1 ]; then rm -rf "$LOG_DIR"; echo "interop: all checks passed"
+  else echo "interop: all checks passed (logs in $LOG_DIR)"; fi
+else
+  echo "interop: $fails check(s) FAILED (logs kept in $LOG_DIR)"; exit 1
+fi

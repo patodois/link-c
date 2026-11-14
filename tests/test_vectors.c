@@ -913,7 +913,7 @@ static int check_control(const JV* c) {
         if (!raw) { format_error("bad hex in", "line_hex"); return failf("bad vector"); }
     }
     if (!rbli_utf8_valid(raw, rawn)) {
-        /* the link refuses such a line before it parses it (rbli_ctl_take_line); sessions.json checks that end to end */
+        /* the link refuses such a line before it parses it (rbli_ctl_next_line); sessions.json checks that end to end */
         free(raw);
         return strcmp(expect, "reject") == 0 ? 0 : failf("the line is not UTF-8 but the vector expects %s", expect);
     }
