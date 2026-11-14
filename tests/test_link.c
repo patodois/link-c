@@ -921,14 +921,24 @@ TEST(handshake_state_flow_and_clean_bye) {
     old_session = hp.session;
 
     rbl_camera_look_at(&cam, eye, tgt, 1.0f, 0.1f, 50.0f, 640, 360);
-    CHECK_EQ(rbl_link_send_camera(p.host, &cam, NULL), RBL_OK);
     CHECK_EQ(rbl_link_spawn(p.guest, 9, "Test", "demo/cube", "Cube"), RBL_OK);
     t = rbl_now_us();
     rbl_pose_identity(&pose, 9, t);
     pose.translation[0] = 42;
-    CHECK_EQ(rbl_link_send_poses(p.guest, &pose, 1), RBL_OK);
-    WAIT_UNTIL(2000, pair_pump(&p), p.gc.cameras > 0 && p.hc.pose_events > 0 && p.hc.spawns > 0, ok);
-    REQUIRE(ok);
+    /* A datagram can be lost, and the pose can overtake the spawn line and be dropped for an unknown entity: the camera
+     * and the pose are sent again until both have arrived (the same pose time is not stale). */
+    {   int tries, settled;
+        ok = 0;
+        for (tries = 0; tries < 10 && !ok; tries++) {
+            CHECK_EQ(rbl_link_send_camera(p.host, &cam, NULL), RBL_OK);
+            CHECK_EQ(rbl_link_send_poses(p.guest, &pose, 1), RBL_OK);
+            WAIT_UNTIL(200, pair_pump(&p), p.gc.cameras > 0 && p.hc.pose_events > 0 && p.hc.spawns > 0, ok);
+        }
+        REQUIRE(ok);
+        /* a repeated datagram that is still on its way arrives before the counts below are taken */
+        WAIT_UNTIL(50, pair_pump(&p), 0, settled);
+        (void)settled;
+    }
     CHECK(p.hc.last_pose_x == 42.0f);
     CHECK_EQ(p.hc.last_spawn_entity, 9); CHECK_STR(p.hc.last_spawn_provider, "Test"); CHECK_STR(p.hc.last_spawn_asset, "demo/cube");
     CHECK(p.hc.last_spawn_has_name); CHECK_STR(p.hc.last_spawn_name, "Cube");
