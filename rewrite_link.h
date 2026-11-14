@@ -3679,8 +3679,9 @@ static int rbli_pixel_rows(rbl_pixel_reader* r, size_t at, size_t stride, size_t
 #if RBLI_PIXEL_VECTOR_IO
     /* Reading wide padding costs more than the saved calls; keep those rows separate. */
     if (stride <= 16u * 1024u && height>1 && (size_t)(height-1)*stride+row <= row*height*4u) return rbli_vector_rows(r,at,stride,row,height,dst);
-#endif
-#if !RBLI_WINDOWS
+#elif !RBLI_WINDOWS
+    /* Unix without preadv: packed spans of up to 32 KiB under the same limits. Every case this takes, the vector
+     * test above takes first, so it is compiled only where that test is not. */
     {
         size_t span = (size_t)(height - 1) * stride + row;
         size_t block_bytes = row > (32u << 10) ? row : (32u << 10);
