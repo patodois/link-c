@@ -2974,24 +2974,27 @@ static void rbli_on_datagram(rbl_link* l, const rbl_decoded* d) {
         break;
     }
     case RBL_POSE: {
+        /* decoded on the stack (at most 102 records); the arena holds only what an event delivers */
+        rbl_pose tmp[RBL_MAX_POSES];
         uint32_t i, nf = 0;
-        rbl_pose* fresh = (rbl_pose*)rbli_arena_alloc(l, sizeof(rbl_pose) * d->u.poses.count);
-        if (!fresh) { l->stats.dropped++; return; }
         for (i = 0; i < d->u.poses.count; i++) {
-            rbl_pose p;
             int idx;
-            rbl_wire_pose(d, i, &p);
-            idx = rbli_ent_find(l, p.entity);
+            rbl_wire_pose(d, i, &tmp[nf]);
+            idx = rbli_ent_find(l, tmp[nf].entity);
             if (idx < 0) { l->stats.unknown_entity++; continue; } /* never spawned (or despawned): no state is kept */
-            if (p.time_us >= l->ent[idx].time_us) {
-                l->ent[idx].time_us = p.time_us;
-                fresh[nf++] = p;
+            if (tmp[nf].time_us >= l->ent[idx].time_us) {
+                l->ent[idx].time_us = tmp[nf].time_us;
+                nf++;
             } else {
                 l->stats.stale++;
             }
         }
         if (nf) {
-            rbl_event* e = rbli_ev_push(l, RBL_EV_POSES);
+            rbl_pose* fresh = (rbl_pose*)rbli_arena_alloc(l, sizeof(rbl_pose) * nf);
+            rbl_event* e;
+            if (!fresh) { l->stats.dropped++; return; }
+            memcpy(fresh, tmp, sizeof(rbl_pose) * nf);
+            e = rbli_ev_push(l, RBL_EV_POSES);
             if (e) { e->u.poses.header = d->header; e->u.poses.poses = fresh; e->u.poses.count = nf; }
         }
         break;
