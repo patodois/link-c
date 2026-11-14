@@ -5,6 +5,7 @@
 #   make asan       run both built with -fsanitize=address,undefined
 #   make build/interop_peer   the program the cross-language interop matrix of rewrite-bridge runs (tests/interop/)
 #   make cxx        compile the implementation as C++11 and use the API from C++
+#                   (make test also compiles the implementation once with REWRITE_LINK_STATIC and -Werror)
 #   make interop    run tests/interop.sh (set RBL_FAKE_HOST, RBL_FAKE_GUEST, RBL_JAVA_CP for the other peers)
 #   make clean
 
@@ -53,10 +54,14 @@ $(BUILD)/test_vectors: tests/test_vectors.c rewrite_link.h | $(BUILD)
 $(BUILD)/test_vectors_asan: tests/test_vectors.c rewrite_link.h | $(BUILD)
 	$(CC) $(CSTD) $(WARN) -O1 -g $(SAN) $(THREADS) tests/test_vectors.c -o $@ $(LDLIBS)
 
+# REWRITE_LINK_STATIC compiles without warnings (compile only)
+$(BUILD)/static_check.o: tests/static_check.c rewrite_link.h | $(BUILD)
+	$(CC) $(CSTD) $(WARN) -Werror $(OPT) -c tests/static_check.c -o $@
+
 $(BUILD)/cxx_check: tests/cxx_check.cpp tests/cxx_other.cpp rewrite_link.h | $(BUILD)
 	$(CXX) -std=c++11 $(WARN) $(OPT) tests/cxx_check.cpp tests/cxx_other.cpp -o $@
 
-test: $(BUILD)/test_link $(BUILD)/test_vectors $(BUILD)/pixel_safety $(LEGACY_TEST)
+test: $(BUILD)/test_link $(BUILD)/test_vectors $(BUILD)/pixel_safety $(LEGACY_TEST) $(BUILD)/static_check.o
 	$(BUILD)/test_link
 	$(BUILD)/test_vectors
 	$(BUILD)/pixel_safety

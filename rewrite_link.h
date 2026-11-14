@@ -13,7 +13,8 @@
  *       #define REWRITE_LINK_IMPLEMENTATION
  *       #include "rewrite_link.h"
  *   everywhere else just #include "rewrite_link.h". Define REWRITE_LINK_STATIC before both to make
- *   every function static (one translation unit only). On Windows, link ws2_32 (and bcrypt for
+ *   every function static (one translation unit only; GCC and Clang also mark them unused, so the ones
+ *   you do not call draw no warning). On Windows, link ws2_32 (and bcrypt for
  *   MinGW; MSVC picks both up by itself), and keep <windows.h> out of the file that holds the
  *   implementation unless you include it with WIN32_LEAN_AND_MEAN.
  *
@@ -105,7 +106,11 @@ extern "C" {
 #endif
 
 #ifdef REWRITE_LINK_STATIC
+#if defined(__GNUC__) || defined(__clang__)
+#define RBLDEF static __attribute__((unused)) /* a program need not call every function */
+#else
 #define RBLDEF static
+#endif
 #else
 #define RBLDEF extern
 #endif

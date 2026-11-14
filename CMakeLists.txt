@@ -58,6 +58,12 @@ target_link_libraries(interop_peer PRIVATE rewrite_link)
 add_executable(cxx_check tests/cxx_check.cpp tests/cxx_other.cpp)
 target_link_libraries(cxx_check PRIVATE rewrite_link)
 
+# REWRITE_LINK_STATIC compiles without warnings (compile only: the build is the check)
+add_library(static_check OBJECT tests/static_check.c)
+if(NOT MSVC)
+  target_compile_options(static_check PRIVATE -Werror)
+endif()
+
 enable_testing()
 add_test(NAME unit COMMAND test_link)
 add_test(NAME vectors COMMAND test_vectors WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
