@@ -1705,7 +1705,7 @@ TEST(review_a_file_truncated_under_a_reader_is_gone_not_a_crash) {
     REQUIRE(rbl_pixel_reader_open(path, &r) == RBL_OK);
     CHECK_EQ(rbl_pixel_reader_read(r, f, (uint32_t)(f % 3), got, sizeof got, gd, 64 * 64, NULL), RBL_OK);
     CHECK(!rbl_pixel_reader_is_gone(r));
-    REQUIRE(truncate(path, 64) == 0); /* the peer truncates the file after the reader mapped it */
+    REQUIRE(truncate(path, 64) == 0); /* the peer truncates the file after the reader opened it */
     CHECK(rbl_pixel_reader_is_gone(r));
     CHECK_EQ(rbl_pixel_reader_read(r, f, (uint32_t)(f % 3), got, sizeof got, gd, 64 * 64, NULL), RBL_MISS_GONE);
     rbl_pixel_reader_stats(r, &st);

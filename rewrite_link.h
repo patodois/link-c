@@ -275,7 +275,7 @@ enum rbl_miss {
     RBL_MISS_BUSY = 1,        /* the slot is being written (odd lock) */
     RBL_MISS_OTHER_FRAME = 2, /* the slot holds another frame */
     RBL_MISS_OVERWRITTEN = 3, /* the writer reached the slot while it was copied */
-    RBL_MISS_GONE = 4         /* the file is shorter than the mapping: drop the reader */
+    RBL_MISS_GONE = 4         /* the file is shorter than when it was opened, or reading it failed: drop the reader */
 };
 
 /* A short description of a status or miss code (a static string). */
@@ -598,8 +598,8 @@ typedef struct rbl_pixel_stats { uint64_t busy, other_frame, overwritten, gone, 
 RBLDEF int rbl_pixel_reader_open(const char* path, rbl_pixel_reader** out);
 RBLDEF void rbl_pixel_reader_info(const rbl_pixel_reader* r, rbl_pixel_info* out);
 RBLDEF int rbl_pixel_reader_has_depth(const rbl_pixel_reader* r);
-/* 1 when the file is now shorter than the mapping (the peer truncated it) or cannot be examined.
- * Reads also detect short positional I/O, so a later truncation is a miss on Unix. */
+/* 1 when the file is now shorter than when the reader opened it (the peer truncated it) or cannot be
+ * examined. Reads also detect short positional I/O, so a later truncation is a miss on Unix. */
 RBLDEF int rbl_pixel_reader_is_gone(const rbl_pixel_reader* r);
 /* Reads the frame that a Frame datagram announced (what RBL_EV_FRAME carries: f->frame, f->slot,
  * f->width, f->height), the way contract section 9.6 says. The frame is skipped (RBL_MISS_OTHER_FRAME,
@@ -3449,8 +3449,14 @@ RBLDEF void rbl_link_stats(const rbl_link* l, rbl_stats* out) { *out = l->stats;
  * and makes it even again; the reader copies and checks that the lock did not change:
  *
  *   writer: lock+1 (relaxed); release fence; header, pixels, depth; lock+2 (release store)
- *   reader: l1 = lock (acquire), odd -> skip; copy; acquire fence; l2 = lock (relaxed)
+ *   reader: l1 = lock, odd -> skip; copy; l2 = lock
  *           l2 != l1 or the copied frame number is not the one announced -> discard
+ *
+ * The writer maps its file and uses the atomics below. A Unix reader never maps the file: it reads
+ * the slot header with l1, then the planes, then l2, each with positional reads (pread, preadv) in
+ * that order, and uses no atomics or fences (the contract notes that pread is not a formal acquire).
+ * A Windows reader maps the file read-only: l1 is an acquire load, and an acquire fence comes after
+ * the slot header and again before l2, which is a relaxed load.
  *
  * With GCC and Clang these are __atomic builtins, which work in C99 and C++. With MSVC they are
  * full barriers (MemoryBarrier) around plain 64-bit accesses (__iso_volatile_load64/store64), a
@@ -3484,7 +3490,7 @@ static inline uint64_t rbli_ld_acquire(const void* p) { return RBLI_LE64(__atomi
 static uint64_t rbli_ld_relaxed(const void* p) { return RBLI_LE64(__atomic_load_n((const uint64_t*)p, __ATOMIC_RELAXED)); }
 static void rbli_st_relaxed(void* p, uint64_t v) { __atomic_store_n((uint64_t*)p, RBLI_LE64(v), __ATOMIC_RELAXED); }
 static void rbli_st_release(void* p, uint64_t v) { __atomic_store_n((uint64_t*)p, RBLI_LE64(v), __ATOMIC_RELEASE); }
-static void rbli_fence_acquire(void) { __atomic_thread_fence(__ATOMIC_ACQUIRE); }
+static inline void rbli_fence_acquire(void) { __atomic_thread_fence(__ATOMIC_ACQUIRE); } /* the Windows reader's */
 static void rbli_fence_release(void) { __atomic_thread_fence(__ATOMIC_RELEASE); }
 static void rbli_fence_full(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
 #endif
@@ -3580,13 +3586,13 @@ static int rbli_narrow(const wchar_t* w, int n, char* out, size_t cap) {
 #endif
 
 struct rbl_pixel_reader {
-    const uint8_t* map;
-    size_t mapped;
 #if RBLI_WINDOWS
+    const uint8_t* map;  /* a read-only view of the whole file */
     HANDLE file, mapping;
 #else
-    int fd;
+    int fd;              /* read with positional I/O only, never mapped */
 #endif
+    size_t size;         /* the file's length when it was opened */
     rbl_pixel_info info;
     uint8_t* plane_scratch;
     size_t plane_capacity;
@@ -3651,7 +3657,7 @@ static int rbli_vector_rows(rbl_pixel_reader* r, size_t at, size_t stride, size_
  * short reads and I/O errors are misses even if a truncation follows a successful fstat.
  * Windows retains the map; an active section prevents ordinary file truncation. */
 static int rbli_pixel_copy(const rbl_pixel_reader* r, size_t at, void* dst, size_t len) {
-    if (at > r->mapped || len > r->mapped - at) return RBL_MISS_GONE;
+    if (at > r->size || len > r->size - at) return RBL_MISS_GONE;
 #if RBLI_WINDOWS
     memcpy(dst, r->map + at, len);
 #else
@@ -3746,7 +3752,7 @@ RBLDEF int rbl_pixel_reader_open(const char* path, rbl_pixel_reader** out) {
         view = MapViewOfFile(r->mapping, FILE_MAP_READ, 0, 0, 0);
         if (!view) { CloseHandle(r->mapping); CloseHandle(r->file); REWRITE_LINK_FREE(r); return RBL_ERR_IO; }
         r->map = (const uint8_t*)view;
-        r->mapped = (size_t)size;
+        r->size = (size_t)size;
         /* The section now prevents truncation. A shrink before CreateFileMapping could
          * have made the view shorter than the earlier size: reject before dereferencing it. */
         if (!GetFileSizeEx(r->file, &sz) || sz.QuadPart < 0 || (uint64_t)sz.QuadPart < size) {
@@ -3781,7 +3787,7 @@ RBLDEF int rbl_pixel_reader_open(const char* path, rbl_pixel_reader** out) {
         }
         size = (uint64_t)after.st_size;
         if (size < RBLI_FILE_HDR || size > (uint64_t)((size_t)-1)) { close(r->fd); REWRITE_LINK_FREE(r); return RBL_ERR_REFUSED; }
-        r->mapped = (size_t)size;
+        r->size = (size_t)size;
     }
 #endif
     /* The sizes in the header come from the peer: none is trusted (see rbli_pf_validate). */
@@ -3805,11 +3811,11 @@ RBLDEF int rbl_pixel_reader_is_gone(const rbl_pixel_reader* r) {
 #if RBLI_WINDOWS
     LARGE_INTEGER sz;
     if (!GetFileSizeEx(r->file, &sz)) return 1;
-    return (uint64_t)sz.QuadPart < (uint64_t)r->mapped;
+    return (uint64_t)sz.QuadPart < (uint64_t)r->size;
 #else
     struct stat st;
     if (fstat(r->fd, &st) != 0) return 1;
-    return (uint64_t)st.st_size < (uint64_t)r->mapped;
+    return (uint64_t)st.st_size < (uint64_t)r->size;
 #endif
 }
 
@@ -3833,10 +3839,11 @@ static int rbli_pixel_read(rbl_pixel_reader* r, uint64_t frame, uint32_t slot, i
     l1 = rbli_ld_acquire(r->map + base);
 #endif
     if (rbli_pixel_copy(r, base, head, sizeof head)) goto gone;
-#if !RBLI_WINDOWS
+#if RBLI_WINDOWS
+    rbli_fence_acquire(); /* step 1 */
+#else
     l1 = rbli_get64(head);
 #endif
-    rbli_fence_acquire(); /* step 1 */
     if (l1 & 1) { r->st.busy++; return RBL_MISS_BUSY; }
     f = rbli_get64(p + 8);
     time_us = rbli_get64(p + 16);
@@ -3853,7 +3860,9 @@ static int rbli_pixel_read(rbl_pixel_reader* r, uint64_t frame, uint32_t slot, i
     need_d = (size_t)w * h;
     if (rgba_cap < need_c || (want_depth && depth_cap < need_d)) {
         /* too small for this frame, unless the header was torn by a writer in the middle of a write */
+#if RBLI_WINDOWS
         rbli_fence_acquire();
+#endif
         if (rbli_pixel_copy(r, base, last, sizeof last)) goto gone;
         if (rbli_get64(last) != l1) { r->st.overwritten++; return RBL_MISS_OVERWRITTEN; }
         return RBL_ERR_TOO_BIG;
@@ -3866,7 +3875,9 @@ static int rbli_pixel_read(rbl_pixel_reader* r, uint64_t frame, uint32_t slot, i
         { size_t i; for (i=0;i<need_d;i++) depth[i] = rbli_getf((const uint8_t*)depth + 4*i); }
 #endif
     }
+#if RBLI_WINDOWS
     rbli_fence_acquire(); /* step 3: the acquire fence, then l2 */
+#endif
     if (rbli_pixel_copy(r, base, last, sizeof last)) goto gone;
 #if RBLI_WINDOWS
     l2 = rbli_ld_relaxed(r->map + base);
@@ -3912,7 +3923,6 @@ RBLDEF void rbl_pixel_reader_close(rbl_pixel_reader* r) {
     if (r->mapping) CloseHandle(r->mapping);
     if (r->file && r->file != INVALID_HANDLE_VALUE) CloseHandle(r->file);
 #else
-    if (r->map) munmap((void*)(uintptr_t)r->map, r->mapped);
     if (r->fd >= 0) close(r->fd);
 #endif
     REWRITE_LINK_FREE(r);
