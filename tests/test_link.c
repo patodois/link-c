@@ -48,6 +48,19 @@ static ssize_t test_control_send(int fd, const void* bytes, size_t length, int f
     return send(fd,bytes,length,flags);
 }
 #define send test_control_send
+
+#include <sys/stat.h>
+/* Test-only: rename another file over the path right after the pixel reader's lstat, before its open. */
+static const char* swap_after_lstat_path;
+static const char* swap_after_lstat_with;
+static int test_lstat(const char* path, struct stat* st) {
+    int r = lstat(path, st);
+    if (swap_after_lstat_path && strcmp(path, swap_after_lstat_path) == 0) {
+        if (rename(swap_after_lstat_with, swap_after_lstat_path) == 0) swap_after_lstat_path = NULL;
+    }
+    return r;
+}
+#define lstat test_lstat
 #endif
 
 #define REWRITE_LINK_IMPLEMENTATION
@@ -1148,6 +1161,72 @@ TEST(a_bye_that_arrived_wins_over_a_later_control_write_error) {
     }
 }
 
+/* CONTRACT.md 7: a side whose unsent control bytes exceed 1 MiB treats the peer as lost. The raw peer never reads. */
+TEST(a_peer_that_stops_reading_the_control_channel_is_lost_above_1_mib) {
+    rbl_config h;
+    rbl_link* host;
+    Col c;
+    Raw r;
+    char line[400];
+    char* big;
+    int i, rc = RBL_OK;
+    memset(&c, 0, sizeof c);
+    rbl_config_init(&h, "H"); h.control_port = 0; h.timeout_ms = 20000;
+    REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
+    REQUIRE(raw_open(&r, rbl_link_control_port(host)));
+    hello_line(line, sizeof line, "guest", 1, 1, r.udp_port, 250);
+    raw_send(&r, line);
+    REQUIRE(raw_wait_line(&r, host, &c, 2000, line, sizeof line)); /* the host's hello; from here on the peer reads nothing */
+    big = (char*)malloc(60001);
+    REQUIRE(big != NULL);
+    memset(big, 'p', 60000); big[60000] = 0;
+    for (i = 0; i < 1000; i++) { /* up to 60 MB: far more than the socket buffers hold, so the queue must pass 1 MiB */
+        rc = rbl_link_spawn(host, (uint32_t)i, big, "a", NULL);
+        if (rc != RBL_OK) break;
+    }
+    free(big);
+    CHECK_EQ(rc, RBL_ERR_NOT_CONNECTED);
+    CHECK(!rbl_link_is_connected(host));
+    col_poll(host, &c);
+    CHECK_EQ(c.lost, 1);
+    CHECK(strstr(c.lost_reason, "peer stopped reading the control channel") != NULL);
+    raw_close(&r);
+    rbl_link_close(host);
+}
+
+/* The configured game (at most 255 bytes) and a disconnect reason (at most 199) are cut before a character, never
+ * inside one; a cut inside one would reach the wire as U+FFFD. */
+TEST(game_and_reason_are_cut_at_a_utf8_boundary) {
+    char game[300], reason[300], line[600];
+    rbl_config h;
+    rbl_link* host;
+    Col c;
+    Raw r;
+    rbl_control m;
+    const char* why;
+    memset(&c, 0, sizeof c);
+    memset(game, 'g', 254); memcpy(game + 254, "\xC3\xA9x", 4);     /* 257 bytes: byte 255 is inside the e-acute */
+    memset(reason, 'r', 198); memcpy(reason + 198, "\xC3\xA9y", 4); /* 201 bytes: byte 199 is inside the e-acute */
+    rbl_config_init(&h, game); h.control_port = 0;
+    REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
+    REQUIRE(raw_open(&r, rbl_link_control_port(host)));
+    hello_line(line, sizeof line, "guest", 1, 1, r.udp_port, 250);
+    raw_send(&r, line);
+    REQUIRE(raw_wait_line(&r, host, &c, 2000, line, sizeof line));
+    REQUIRE(parse_line(line, &m, &why) == RBL_OK);
+    REQUIRE(m.type == RBL_CTL_HELLO);
+    CHECK_EQ(m.u.hello.game.len, 254);
+    CHECK(m.u.hello.game.len == 254 && memcmp(m.u.hello.game.ptr, game, 254) == 0);
+    rbl_link_disconnect(host, reason);
+    REQUIRE(raw_wait_line(&r, host, &c, 2000, line, sizeof line));
+    REQUIRE(parse_line(line, &m, &why) == RBL_OK);
+    REQUIRE(m.type == RBL_CTL_BYE);
+    CHECK_EQ(m.u.bye.reason.len, 198);
+    CHECK(m.u.bye.reason.len == 198 && memcmp(m.u.bye.reason.ptr, reason, 198) == 0);
+    raw_close(&r);
+    rbl_link_close(host);
+}
+
 TEST(close_returns_within_the_linger_even_if_the_peer_never_closes) {
     rbl_config h;
     rbl_link* host;
@@ -1712,6 +1791,31 @@ TEST(review_a_file_truncated_under_a_reader_is_gone_not_a_crash) {
     CHECK_EQ(st.gone, 1);
     rbl_pixel_reader_close(r);
     rbl_pixel_writer_close(w); /* it unmaps the whole mapping, never touching the cut pages */
+}
+
+/* The reader checks the path with lstat, opens it, and requires the open file to be the same device and inode: a valid
+ * pixel file renamed over the path between the two is refused. test_lstat does the rename at that moment. */
+TEST(the_reader_refuses_a_file_swapped_between_its_check_and_its_open) {
+    char path[512], other[512];
+    rbl_pixel_writer* w;
+    rbl_pixel_writer* w2;
+    rbl_pixel_reader* r = NULL;
+    tmp_path(path, sizeof path, "checked.frames");
+    tmp_path(other, sizeof other, "swapped-in.frames");
+    REQUIRE(rbl_pixel_writer_create(path, 4, 4, 2, 0, &w) == RBL_OK);
+    REQUIRE(rbl_pixel_writer_create(other, 4, 4, 2, 0, &w2) == RBL_OK); /* valid too, another inode */
+    swap_after_lstat_path = path;
+    swap_after_lstat_with = other;
+    CHECK_EQ(rbl_pixel_reader_open(path, &r), RBL_ERR_REFUSED);
+    CHECK(swap_after_lstat_path == NULL); /* the swap happened */
+    swap_after_lstat_path = NULL;
+    if (r) rbl_pixel_reader_close(r);
+    r = NULL;
+    REQUIRE(rbl_pixel_reader_open(path, &r) == RBL_OK); /* without a swap the file that is there now opens */
+    rbl_pixel_reader_close(r);
+    rbl_pixel_writer_close(w);  /* removes the path, now the swapped-in file */
+    rbl_pixel_writer_close(w2); /* its own name is gone already */
+    CHECK(!exists(path)); CHECK(!exists(other));
 }
 #endif
 
@@ -2879,6 +2983,8 @@ int main(void) {
     RUN(bye_is_delivered_and_the_close_is_clean_while_the_closer_has_unread_data);
     RUN(close_returns_within_the_linger_even_if_the_peer_never_closes);
     RUN(a_bye_that_arrived_wins_over_a_later_control_write_error);
+    RUN(a_peer_that_stops_reading_the_control_channel_is_lost_above_1_mib);
+    RUN(game_and_reason_are_cut_at_a_utf8_boundary);
     RUN(datagrams_from_another_address_are_dropped);
     RUN(a_datagram_of_another_version_from_the_peer_is_malformed_not_foreign);
     RUN(peer_address_must_be_127_0_0_1_and_the_announced_port);
@@ -2895,6 +3001,7 @@ int main(void) {
 #if !RBLI_WINDOWS
     RUN(review_symlink_directory_and_fifo_are_refused);
     RUN(review_a_file_truncated_under_a_reader_is_gone_not_a_crash);
+    RUN(the_reader_refuses_a_file_swapped_between_its_check_and_its_open);
 #endif
     RUN(pixel_file_seqlock_under_contention);
     RUN(late_old_udp_does_not_poison_the_new_channel);
