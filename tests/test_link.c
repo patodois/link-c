@@ -996,12 +996,14 @@ TEST(handshake_state_flow_and_clean_bye) {
     CHECK_EQ(p.hc.last_spawn_entity, 9); CHECK_STR(p.hc.last_spawn_provider, "Test"); CHECK_STR(p.hc.last_spawn_asset, "demo/cube");
     CHECK(p.hc.last_spawn_has_name); CHECK_STR(p.hc.last_spawn_name, "Cube");
 
-    /* a stale pose (older time) is dropped */
+    /* an older pose time is not sent as it is: the sender raises it to the last one plus 1 us (revision 8, section 5), and the
+     * receiver uses it */
     old = pose; old.time_us = t - 1000;
-    {   int before = p.hc.pose_events; rbl_stats s0 = stats_of(p.host);
+    {   int before = p.hc.pose_events; rbl_stats g0 = stats_of(p.guest);
         CHECK_EQ(rbl_link_send_poses(p.guest, &old, 1), RBL_OK);
-        WAIT_UNTIL(300, pair_pump(&p), stats_of(p.host).stale > s0.stale, ok);
-        CHECK(ok); CHECK_EQ(p.hc.pose_events, before); }
+        CHECK_EQ(stats_of(p.guest).pose_time_raised, g0.pose_time_raised + 1);
+        WAIT_UNTIL(1000, pair_pump(&p), p.hc.pose_events > before, ok);
+        CHECK(ok); }
 
     /* focus: the guest asks, the host grants */
     CHECK_EQ(rbl_link_set_focus(p.guest, RBL_ROLE_GUEST), RBL_OK);
@@ -2237,6 +2239,152 @@ TEST(review_only_spawned_entities_have_pose_state_at_most_1024) {
     pair_close(&p);
 }
 
+/* ---- revision 8: pose order (contract sections 5, 7, 8 spawn, 9.4) ---- */
+
+/* A host and a raw guest in a live session; *session gets the session number. */
+static int raw_session(rbl_link** host, Raw* r, Col* c, uint32_t* session) {
+    rbl_config h;
+    char line[400];
+    rbl_control m;
+    const char* why;
+    memset(c, 0, sizeof *c);
+    rbl_config_init(&h, "H"); h.control_port = 0; h.timeout_ms = 10000;
+    if (rbl_link_host(&h, host) != RBL_OK) return 0;
+    if (!raw_open(r, rbl_link_control_port(*host))) return 0;
+    hello_line(line, sizeof line, "guest", 1, 1, r->udp_port, 250);
+    raw_send(r, line);
+    if (!raw_wait_line(r, *host, c, 2000, line, sizeof line)) return 0;
+    if (parse_line(line, &m, &why) != RBL_OK || m.type != RBL_CTL_HELLO) return 0;
+    *session = m.u.hello.session;
+    return rbl_link_is_connected(*host);
+}
+/* The raw guest sends one pose of `entity` at `time`; 1 if the host used it (a pose event), 0 if it dropped it as stale. */
+static int raw_pose_used(rbl_link* host, Raw* r, Col* c, uint32_t session, uint32_t seq, uint32_t entity, uint64_t time,
+                         uint32_t flags) {
+    uint8_t b[256];
+    rbl_header h = mk_header(session, seq, rbl_now_us());
+    rbl_pose pose;
+    int n, before = c->pose_recs[entity], used = 0, done;
+    uint64_t stale0 = stats_of(host).stale;
+    rbl_pose_identity(&pose, entity, time);
+    pose.flags = flags;
+    n = rbl_wire_encode_poses(&h, &pose, 1, b, sizeof b);
+    if (n <= 0 || !rbli_udp_send(r->udp, b, (size_t)n, rbl_link_udp_port(host))) return -1;
+    WAIT_UNTIL(1000, col_poll(host, c), (used = c->pose_recs[entity] > before) || stats_of(host).stale > stale0, done);
+    return done ? used : -1;
+}
+
+TEST(a_receiver_takes_a_teleport_or_a_respawned_entitys_pose_whatever_its_time) {
+    rbl_link* host;
+    Raw r;
+    Col c;
+    uint32_t session;
+    int ok;
+    REQUIRE(raw_session(&host, &r, &c, &session));
+    raw_send(&r, "{\"type\":\"spawn\",\"entity\":5,\"provider\":\"P\",\"asset\":\"a\"}\n");
+    WAIT_UNTIL(2000, col_poll(host, &c), c.spawns == 1, ok);
+    REQUIRE(ok);
+    CHECK_EQ(raw_pose_used(host, &r, &c, session, 1, 5, 1000, 0), 1);
+    CHECK_EQ(raw_pose_used(host, &r, &c, session, 2, 5, 999, RBL_POSE_TELEPORT), 1); /* older, but a teleport */
+    CHECK_EQ(raw_pose_used(host, &r, &c, session, 3, 5, 999, 0), 1);                 /* ordered after it: equal is used */
+    CHECK_EQ(raw_pose_used(host, &r, &c, session, 4, 5, 998, 0), 0);                 /* a plain older pose is dropped */
+    CHECK_EQ(raw_pose_used(host, &r, &c, session, 5, 5, UINT64_MAX, 0), 1);
+    CHECK_EQ(raw_pose_used(host, &r, &c, session, 6, 5, 1001, 0), 0);
+    /* a spawn of the live entity forgets the time of its last pose */
+    raw_send(&r, "{\"type\":\"spawn\",\"entity\":5,\"provider\":\"P\",\"asset\":\"a\"}\n");
+    WAIT_UNTIL(2000, col_poll(host, &c), c.spawns == 2, ok);
+    REQUIRE(ok);
+    CHECK_EQ(raw_pose_used(host, &r, &c, session, 7, 5, 10, 0), 1);
+    CHECK_EQ(raw_pose_used(host, &r, &c, session, 8, 5, 9, 0), 0);
+    CHECK_EQ(raw_pose_used(host, &r, &c, session, 9, 5, 10, 0), 1);
+    raw_close(&r);
+    rbl_link_close(host);
+}
+
+/* The time of the next pose datagram of `entity` the raw peer receives from the UT; UINT64_MAX - 1 if none comes. */
+static uint64_t raw_next_pose_time(rbl_link* ut, Raw* r, Col* c, uint32_t entity) {
+    uint64_t end = rbli_mono_ms() + 1000;
+    while (rbli_mono_ms() < end) {
+        uint8_t d[16384];
+        uint32_t addr;
+        uint16_t port;
+        rbl_decoded dec;
+        int n;
+        col_poll(ut, c);
+        while ((n = rbli_udp_recv(r->udp, d, sizeof d, &addr, &port)) >= 0) {
+            if (rbl_wire_decode(d, (size_t)n, &dec) == RBL_OK && dec.header.kind == RBL_POSE) {
+                uint32_t i;
+                for (i = 0; i < dec.u.poses.count; i++) {
+                    rbl_pose p;
+                    rbl_wire_pose(&dec, i, &p);
+                    if (p.entity == entity) return p.time_us;
+                }
+            }
+        }
+        rbli_sleep_ms(2);
+    }
+    return UINT64_MAX - 1;
+}
+static uint64_t ut_sends_pose(rbl_link* ut, Raw* r, Col* c, uint32_t entity, uint64_t time, uint32_t flags) {
+    rbl_pose pose;
+    rbl_pose_identity(&pose, entity, time);
+    pose.flags = flags;
+    if (rbl_link_send_poses(ut, &pose, 1) != RBL_OK) return UINT64_MAX - 2;
+    return raw_next_pose_time(ut, r, c, entity);
+}
+
+TEST(a_sender_never_sends_an_entity_an_older_pose_time) {
+    rbl_link* host;
+    Raw r;
+    Col c;
+    uint32_t session;
+    rbl_pose many[3];
+    REQUIRE(raw_session(&host, &r, &c, &session));
+    REQUIRE(rbl_link_spawn(host, 7, "P", "a", NULL) == RBL_OK);
+    CHECK_EQ(ut_sends_pose(host, &r, &c, 7, 1000, 0), 1000);
+    CHECK_EQ(ut_sends_pose(host, &r, &c, 7, 500, 0), 1001);                /* raised to the last time plus 1 us */
+    CHECK_EQ(stats_of(host).pose_time_raised, 1);
+    CHECK_EQ(ut_sends_pose(host, &r, &c, 7, 1001, 0), 1001);               /* an equal time is not older */
+    CHECK_EQ(ut_sends_pose(host, &r, &c, 7, 400, RBL_POSE_TELEPORT), 400); /* a teleport carries its own time */
+    CHECK_EQ(ut_sends_pose(host, &r, &c, 7, 400, 0), 400);                 /* and the order starts again from it */
+    CHECK_EQ(ut_sends_pose(host, &r, &c, 7, 300, 0), 401);
+    REQUIRE(rbl_link_spawn(host, 7, "P", "a", NULL) == RBL_OK);           /* a spawn of the live entity: any time again */
+    CHECK_EQ(ut_sends_pose(host, &r, &c, 7, 10, 0), 10);
+    CHECK_EQ(ut_sends_pose(host, &r, &c, 7, UINT64_MAX, 0), UINT64_MAX);
+    CHECK_EQ(ut_sends_pose(host, &r, &c, 7, 5, 0), UINT64_MAX);            /* the largest value stays itself */
+    CHECK_EQ(stats_of(host).pose_time_raised, 3);
+    /* each entity has its own order, also within one datagram, in record order */
+    rbl_pose_identity(&many[0], 8, 50); rbl_pose_identity(&many[1], 8, 40); rbl_pose_identity(&many[2], 9, 1);
+    REQUIRE(rbl_link_send_poses(host, many, 3) == RBL_OK);
+    {   uint64_t end = rbli_mono_ms() + 1000;
+        int got = 0;
+        while (!got && rbli_mono_ms() < end) {
+            uint8_t d[16384];
+            uint32_t addr;
+            uint16_t port;
+            rbl_decoded dec;
+            int n;
+            while ((n = rbli_udp_recv(r.udp, d, sizeof d, &addr, &port)) >= 0) {
+                if (rbl_wire_decode(d, (size_t)n, &dec) == RBL_OK && dec.header.kind == RBL_POSE && dec.u.poses.count == 3) {
+                    rbl_pose a, b, e;
+                    rbl_wire_pose(&dec, 0, &a); rbl_wire_pose(&dec, 1, &b); rbl_wire_pose(&dec, 2, &e);
+                    CHECK_EQ(a.time_us, 50); CHECK_EQ(b.time_us, 51); CHECK_EQ(e.time_us, 1);
+                    got = 1;
+                }
+            }
+            col_poll(host, &c);
+            rbli_sleep_ms(2);
+        }
+        CHECK(got);
+    }
+    /* a despawned entity is forgotten too */
+    REQUIRE(rbl_link_despawn(host, 8) == RBL_OK);
+    REQUIRE(rbl_link_spawn(host, 8, "P", "a", NULL) == RBL_OK);
+    CHECK_EQ(ut_sends_pose(host, &r, &c, 8, 3, 0), 3);
+    raw_close(&r);
+    rbl_link_close(host);
+}
+
 TEST(review_unknown_entity_and_spawn_ignored_counters) {
     Pair p;
     int e, ok;
@@ -3144,6 +3292,8 @@ int main(void) {
     RUN(review_empty_collision_snapshot_is_one_chunk);
     RUN(review_sending_without_a_peer_is_an_error);
     RUN(review_only_spawned_entities_have_pose_state_at_most_1024);
+    RUN(a_receiver_takes_a_teleport_or_a_respawned_entitys_pose_whatever_its_time);
+    RUN(a_sender_never_sends_an_entity_an_older_pose_time);
     RUN(review_unknown_entity_and_spawn_ignored_counters);
     RUN(review_our_own_heartbeat_is_within_what_a_hello_may_announce);
     RUN(review_heartbeat_ms_outside_10_to_10000_is_a_handshake_error);

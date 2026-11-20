@@ -41,7 +41,7 @@
  *   - Not thread safe: use one link from one thread, or lock around every call yourself.
  *
  * MEMORY (what the library allocates; everything else lives in your buffers)
- *   - rbl_link_host/guest: the link object (about 64 KiB), freed by rbl_link_close().
+ *   - rbl_link_host/guest: the link object (about 90 KiB), freed by rbl_link_close().
  *   - While a session runs: the control channel's read and write buffers (bounded by the
  *     contract: 64 KiB lines, 1 MiB unsent), the events' strings, poses and assembled collision
  *     triangles for the length of one poll, the copy of a collision snapshot you queue with
@@ -508,6 +508,7 @@ typedef struct rbl_stats {
     uint64_t unknown_entity; /* pose records for an entity the peer never spawned */
     uint64_t spawn_ignored;  /* spawns beyond the 1024-entity table */
     uint64_t dropped;        /* events or data dropped for lack of memory */
+    uint64_t pose_time_raised; /* revision 8: poses sent with the entity's last time plus 1 us instead of an older time */
 } rbl_stats;
 
 /* Creates a host: listens on 127.0.0.1:control_port, binds the UDP socket, then (revision 6) writes
@@ -531,7 +532,10 @@ RBLDEF int rbl_link_poll(rbl_link* link, rbl_event* events, size_t cap);
 /* Sends the camera; *seq_out (if not NULL) gets the datagram's seq, which a guest quotes in
  * rbl_frame.camera_seq. */
 RBLDEF int rbl_link_send_camera(rbl_link* link, const rbl_camera* camera, uint32_t* seq_out);
-/* Sends poses, 102 per datagram. The entity must be spawned first (rbl_link_spawn). */
+/* Sends poses, 102 per datagram. The entity must be spawned first (rbl_link_spawn). Revision 8: an entity's pose times never
+ * go back. A pose older than the last one sent for its entity is sent with that time plus 1 us, and counted in
+ * stats.pose_time_raised; a pose with RBL_POSE_TELEPORT, and the first pose after rbl_link_spawn of the entity, carry their
+ * own time and start the order again (the receiver does the same). */
 RBLDEF int rbl_link_send_poses(rbl_link* link, const rbl_pose* poses, size_t count);
 /* Queues a collision snapshot (copying the triangles) and returns its query number in
  * *query_out. The chunks go out 32 per rbl_link_poll(), so keep polling; a snapshot queued while
@@ -540,7 +544,7 @@ RBLDEF int rbl_link_send_collision(rbl_link* link, const float center[3], float 
                                    const rbl_triangle* triangles, size_t count, uint32_t* query_out);
 /* Announces a frame you wrote into the pixel file (after rbl_pixel_writer_write). */
 RBLDEF int rbl_link_send_frame(rbl_link* link, const rbl_frame* frame);
-/* name may be NULL. A second spawn of the same entity replaces the first. */
+/* name may be NULL. A second spawn of the same entity replaces the first; its next pose may carry any time (revision 8). */
 RBLDEF int rbl_link_spawn(rbl_link* link, uint32_t entity, const char* provider, const char* asset, const char* name);
 RBLDEF int rbl_link_despawn(rbl_link* link, uint32_t entity);
 /* Host: gives the focus to `focus`. Guest: asks the host for it. */
@@ -2133,6 +2137,8 @@ typedef struct rbli_closing {
 typedef struct rbli_chunk { rbl_triangle* t; uint32_t n; uint32_t got; } rbli_chunk;
 
 typedef struct rbli_ent { uint64_t time_us; uint32_t id; uint32_t used; } rbli_ent;
+/* An entity table: open addressing, at most RBL_MAX_ENTITIES used of RBLI_ENT_CAP places. */
+typedef struct rbli_etab { rbli_ent e[RBLI_ENT_CAP]; uint32_t n; } rbli_etab;
 
 typedef enum rbli_state { RBLI_IDLE = 0, RBLI_CONNECTING, RBLI_HANDSHAKE, RBLI_LIVE } rbli_state;
 
@@ -2175,8 +2181,8 @@ struct rbl_link {
     /* per-session receive state */
     int has_last_camera;
     uint32_t last_camera;
-    rbli_ent ent[RBLI_ENT_CAP];
-    uint32_t nent;
+    rbli_etab ent;       /* the peer's live entities, with the time of the last pose used of each */
+    rbli_etab sent;      /* revision 8: this side's entities, with the time of the last pose sent of each */
     int spawn_ignored_logged;
     int has_last_collision;
     uint32_t last_collision;
@@ -2299,35 +2305,36 @@ static void rbli_report_end(rbl_link* l, int was_live, const char* reason) {
 
 static unsigned rbli_ent_hash(uint32_t id) { return (unsigned)((id * 2654435761u) >> 21) & (RBLI_ENT_CAP - 1); }
 
-static int rbli_ent_find(const rbl_link* l, uint32_t id) {
+static int rbli_ent_find(const rbli_etab* t, uint32_t id) {
     unsigned i = rbli_ent_hash(id);
-    while (l->ent[i].used) {
-        if (l->ent[i].id == id) return (int)i;
+    while (t->e[i].used) {
+        if (t->e[i].id == id) return (int)i;
         i = (i + 1) & (RBLI_ENT_CAP - 1);
     }
     return -1;
 }
-static void rbli_ent_insert(rbl_link* l, uint32_t id) {
+static int rbli_ent_insert(rbli_etab* t, uint32_t id) {
     unsigned i = rbli_ent_hash(id);
-    while (l->ent[i].used) i = (i + 1) & (RBLI_ENT_CAP - 1);
-    l->ent[i].used = 1;
-    l->ent[i].id = id;
-    l->ent[i].time_us = 0;
-    l->nent++;
+    while (t->e[i].used) i = (i + 1) & (RBLI_ENT_CAP - 1);
+    t->e[i].used = 1;
+    t->e[i].id = id;
+    t->e[i].time_us = 0;
+    t->n++;
+    return (int)i;
 }
-static void rbli_ent_remove(rbl_link* l, int idx) {
+static void rbli_ent_remove(rbli_etab* t, int idx) {
     unsigned i = (unsigned)idx, j = i;
     for (;;) {
         unsigned k;
         j = (j + 1) & (RBLI_ENT_CAP - 1);
-        if (!l->ent[j].used) break;
-        k = rbli_ent_hash(l->ent[j].id);
+        if (!t->e[j].used) break;
+        k = rbli_ent_hash(t->e[j].id);
         if (i <= j ? (i < k && k <= j) : (i < k || k <= j)) continue;
-        l->ent[i] = l->ent[j];
+        t->e[i] = t->e[j];
         i = j;
     }
-    l->ent[i].used = 0;
-    l->nent--;
+    t->e[i].used = 0;
+    t->n--;
 }
 
 /* ---- control channel ---- */
@@ -2537,8 +2544,8 @@ static void rbli_asm_clear(rbl_link* l) {
 static void rbli_reset_session(rbl_link* l) {
     l->focus = RBL_ROLE_HOST;
     l->has_last_camera = 0;
-    memset(l->ent, 0, sizeof l->ent);
-    l->nent = 0;
+    memset(&l->ent, 0, sizeof l->ent);
+    memset(&l->sent, 0, sizeof l->sent);
     l->spawn_ignored_logged = 0;
     rbli_cq_clear(l);
     l->has_last_collision = 0;
@@ -2811,9 +2818,13 @@ static int rbli_on_line(rbl_link* l, char* line, size_t len, uint64_t now, char*
         *bye = 1;
         return 1;
     case RBL_CTL_SPAWN: {
-        /* A second spawn of a live id replaces the first; a new id needs a free place. */
-        if (rbli_ent_find(l, m.u.spawn.entity) < 0) {
-            if (l->nent >= RBL_MAX_ENTITIES) {
+        /* A second spawn of a live id replaces the first and (revision 8) forgets the time of its last pose, so its next
+         * pose is used whatever its time; a new id needs a free place. */
+        int idx = rbli_ent_find(&l->ent, m.u.spawn.entity);
+        if (idx >= 0) {
+            l->ent.e[idx].time_us = 0;
+        } else {
+            if (l->ent.n >= RBL_MAX_ENTITIES) {
                 l->stats.spawn_ignored++;
                 if (!l->spawn_ignored_logged) {
                     l->spawn_ignored_logged = 1;
@@ -2822,7 +2833,7 @@ static int rbli_on_line(rbl_link* l, char* line, size_t len, uint64_t now, char*
                 }
                 return 0;
             }
-            rbli_ent_insert(l, m.u.spawn.entity);
+            rbli_ent_insert(&l->ent, m.u.spawn.entity);
         }
         {
             char* provider = rbli_arena_str(l, m.u.spawn.provider);
@@ -2842,10 +2853,10 @@ static int rbli_on_line(rbl_link* l, char* line, size_t len, uint64_t now, char*
         return 0;
     }
     case RBL_CTL_DESPAWN: {
-        int idx = rbli_ent_find(l, m.u.despawn.entity);
+        int idx = rbli_ent_find(&l->ent, m.u.despawn.entity);
         if (idx >= 0) {
             rbl_event* e;
-            rbli_ent_remove(l, idx);
+            rbli_ent_remove(&l->ent, idx);
             e = rbli_ev_push(l, RBL_EV_DESPAWN);
             if (e) e->u.despawn.entity = m.u.despawn.entity;
         }
@@ -3007,10 +3018,12 @@ static void rbli_on_datagram(rbl_link* l, const rbl_decoded* d) {
         for (i = 0; i < d->u.poses.count; i++) {
             int idx;
             rbl_wire_pose(d, i, &tmp[nf]);
-            idx = rbli_ent_find(l, tmp[nf].entity);
+            idx = rbli_ent_find(&l->ent, tmp[nf].entity);
             if (idx < 0) { l->stats.unknown_entity++; continue; } /* never spawned (or despawned): no state is kept */
-            if (tmp[nf].time_us >= l->ent[idx].time_us) {
-                l->ent[idx].time_us = tmp[nf].time_us;
+            /* in record order: a pose older than the last one used is dropped, unless it has the TELEPORT flag, which is used
+             * whatever its time and starts the entity's order again at its own time (revision 8, sections 7 and 9.4) */
+            if (tmp[nf].time_us >= l->ent.e[idx].time_us || (tmp[nf].flags & RBL_POSE_TELEPORT)) {
+                l->ent.e[idx].time_us = tmp[nf].time_us;
                 nf++;
             } else {
                 l->stats.stale++;
@@ -3309,16 +3322,36 @@ RBLDEF int rbl_link_send_camera(rbl_link* l, const rbl_camera* c, uint32_t* seq_
     return RBL_OK;
 }
 
+/* Revision 8 (section 5): an entity's pose times never go back. A pose whose time_us is lower than the last one sent for its
+ * entity is sent with that time plus one microsecond (the largest value stays itself) and counted; a pose with the TELEPORT
+ * flag, and the first pose after rbl_link_spawn of the entity, carry their own time and start the order again. At most
+ * RBL_MAX_ENTITIES entities are followed at a time (as many as a peer keeps); a pose of one more is sent as given. */
+static void rbli_order_pose(rbl_link* l, rbl_pose* p) {
+    int idx = rbli_ent_find(&l->sent, p->entity);
+    if (idx < 0) {
+        if (l->sent.n >= RBL_MAX_ENTITIES) return;
+        idx = rbli_ent_insert(&l->sent, p->entity);
+    } else if (!(p->flags & RBL_POSE_TELEPORT) && p->time_us < l->sent.e[idx].time_us) {
+        uint64_t last = l->sent.e[idx].time_us;
+        p->time_us = last == UINT64_MAX ? last : last + 1;
+        l->stats.pose_time_raised++;
+    }
+    l->sent.e[idx].time_us = p->time_us;
+}
+
 RBLDEF int rbl_link_send_poses(rbl_link* l, const rbl_pose* poses, size_t count) {
-    size_t i;
+    size_t i, k;
     if (!l || (count && !poses)) return RBL_ERR_ARGS;
     if (!rbli_live(l)) return RBL_ERR_NOT_CONNECTED;
     for (i = 0; i < count; i += RBL_MAX_POSES) {
         rbl_header h;
+        rbl_pose ordered[RBL_MAX_POSES];
         size_t n = count - i < RBL_MAX_POSES ? count - i : RBL_MAX_POSES;
         int len;
         rbli_live_header(l, &h);
-        len = rbl_wire_encode_poses(&h, poses + i, n, l->tx, sizeof l->tx);
+        memcpy(ordered, poses + i, sizeof(rbl_pose) * n);
+        for (k = 0; k < n; k++) rbli_order_pose(l, &ordered[k]); /* n is 1..102: the encoder below cannot refuse it */
+        len = rbl_wire_encode_poses(&h, ordered, n, l->tx, sizeof l->tx);
         if (len < 0) return len;
         rbli_emit(l, len);
     }
@@ -3365,6 +3398,7 @@ RBLDEF int rbl_link_send_frame(rbl_link* l, const rbl_frame* f) {
 
 RBLDEF int rbl_link_spawn(rbl_link* l, uint32_t entity, const char* provider, const char* asset, const char* name) {
     rbl_control m;
+    int rc;
     if (!l || !provider || !asset) return RBL_ERR_ARGS;
     memset(&m, 0, sizeof m);
     m.type = RBL_CTL_SPAWN;
@@ -3373,16 +3407,27 @@ RBLDEF int rbl_link_spawn(rbl_link* l, uint32_t entity, const char* provider, co
     m.u.spawn.asset = rbli_cstr(asset);
     m.u.spawn.has_name = name != NULL;
     m.u.spawn.name = rbli_cstr(name);
-    return rbli_send_control(l, &m);
+    rc = rbli_send_control(l, &m);
+    if (rc == RBL_OK) { /* revision 8: the entity's next pose may carry any time (sections 5 and 8, spawn) */
+        int idx = rbli_ent_find(&l->sent, entity);
+        if (idx >= 0) rbli_ent_remove(&l->sent, idx);
+    }
+    return rc;
 }
 
 RBLDEF int rbl_link_despawn(rbl_link* l, uint32_t entity) {
     rbl_control m;
+    int rc;
     if (!l) return RBL_ERR_ARGS;
     memset(&m, 0, sizeof m);
     m.type = RBL_CTL_DESPAWN;
     m.u.despawn.entity = entity;
-    return rbli_send_control(l, &m);
+    rc = rbli_send_control(l, &m);
+    if (rc == RBL_OK) {
+        int idx = rbli_ent_find(&l->sent, entity);
+        if (idx >= 0) rbli_ent_remove(&l->sent, idx);
+    }
+    return rc;
 }
 
 RBLDEF int rbl_link_set_focus(rbl_link* l, rbl_role focus) {
