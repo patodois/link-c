@@ -61,6 +61,12 @@ static int test_lstat(const char* path, struct stat* st) {
     return r;
 }
 #define lstat test_lstat
+
+#include <unistd.h>
+/* Test-only: the effective user the endpoint reader compares the file's owner with, moved by g_euid_shift. */
+static unsigned g_euid_shift;
+static uid_t test_geteuid(void) { return (uid_t)(geteuid() + g_euid_shift); }
+#define geteuid test_geteuid
 #endif
 
 #define REWRITE_LINK_IMPLEMENTATION
@@ -3312,6 +3318,42 @@ TEST(endpoint_reader_refuses_a_file_others_can_read) {
 }
 #endif
 
+#if !RBLI_WINDOWS
+/* Revision 8 (contract 6.2): an endpoint file that belongs to another user is refused, even with mode 0600. No test can make a
+ * file of another user's without root, so the reader is shown another effective user instead. */
+TEST(endpoint_reader_refuses_a_file_of_another_user) {
+    char dir[1100], path[1300], tok[257];
+    uint16_t port;
+    REQUIRE(ep_dir(dir, sizeof dir, 3));
+    ep_path(path, sizeof path, dir, "game.json");
+    CHECK_EQ(rbl_endpoint_write(path, 47800, "abc"), RBL_OK);
+    CHECK_EQ(rbl_endpoint_read(path, &port, tok), RBL_OK);
+    g_euid_shift = 1;
+    CHECK_EQ(rbl_endpoint_read(path, &port, tok), RBL_ERR_REFUSED);
+    CHECK(port == 0 && tok[0] == 0);
+    g_euid_shift = 0;
+    CHECK_EQ(rbl_endpoint_read(path, &port, tok), RBL_OK);
+    ep_rm(path);
+    ep_rmdir(dir);
+}
+
+/* Revision 8 (contract 9.6): the pixel file is readable and writable by its owner only from the moment it exists, whatever
+ * the umask lets through. */
+TEST(the_pixel_file_is_created_owner_only) {
+    char path[512];
+    rbl_pixel_writer* w;
+    struct stat st;
+    mode_t old = umask(0);
+    tmp_path(path, sizeof path, "mode.frames");
+    CHECK_EQ(rbl_pixel_writer_create(path, 4, 2, 3, 0, &w), RBL_OK);
+    umask(old);
+    REQUIRE(w != NULL);
+    REQUIRE(stat(path, &st) == 0);
+    CHECK_EQ(st.st_mode & 0777, 0600);
+    rbl_pixel_writer_close(w);
+}
+#endif
+
 /* Revision 8 (contract 9.6, item 5): on Windows a pixel file path is a drive-letter path, decided on the text before any
  * file-system call. The rule is pure, so it is tested on every platform. */
 TEST(windows_pixel_paths_are_drive_letter_paths_only) {
@@ -3821,6 +3863,8 @@ int main(void) {
     RUN(endpoint_file_round_trip_replace_and_no_temp_file_left);
 #if !RBLI_WINDOWS
     RUN(endpoint_reader_refuses_a_file_others_can_read);
+    RUN(endpoint_reader_refuses_a_file_of_another_user);
+    RUN(the_pixel_file_is_created_owner_only);
 #endif
     RUN(windows_pixel_paths_are_drive_letter_paths_only);
     RUN(config_defaults_and_bad_tokens);

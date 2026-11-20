@@ -410,11 +410,12 @@ RBLDEF int rbl_token_equal(const void* a, size_t alen, const void* b, size_t ble
 RBLDEF int rbl_endpoint_write(const char* path, uint16_t port, const char* token);
 /* Reads and checks an endpoint file: path must name a regular file (checked before it is opened, so a
  * FIFO cannot block; symbolic links are followed); on Unix a file whose mode has any group or other
- * bit (mode & 077) is refused; at most 4096 bytes; one trailing "\n" or "\r\n" is dropped; the rest must
+ * bit (mode & 077) is refused, and (revision 8) one that does not belong to the effective user, both checked on the path and
+ * on the opened file; at most 4096 bytes; one trailing "\n" or "\r\n" is dropped; the rest must
  * be one JSON object under the control line rules (contract section 8) with control_port an integer
  * 1..65535 and token a string of 1..256 bytes; other fields are ignored. token_out receives the token
  * and a NUL (257 bytes). Returns RBL_OK; RBL_ERR_IO (missing or unreadable, rbl_os_error has the code);
- * RBL_ERR_REFUSED (not a regular file, or permissions); RBL_ERR_MALFORMED (contents; also a file
+ * RBL_ERR_REFUSED (not a regular file, permissions or owner); RBL_ERR_MALFORMED (contents; also a file
  * above 4096 bytes); RBL_ERR_ARGS. On failure *port is 0 and token_out is empty. The result never
  * quotes the file. */
 RBLDEF int rbl_endpoint_read(const char* path, uint16_t* port, char token_out[257]);
@@ -4622,6 +4623,9 @@ RBLDEF int rbl_endpoint_read(const char* path, uint16_t* port, char token_out[25
         if (stat(path, &st) != 0) return RBL_ERR_IO; /* no file: the host is not running (yet) */
         if (!S_ISREG(st.st_mode)) return RBL_ERR_REFUSED;
         if (st.st_mode & 077) return RBL_ERR_REFUSED; /* group or others could read it, so someone else could have written it */
+        /* revision 8: and it belongs to this effective user: a guest that can read other users' owner-only files (root, or one
+         * with a capability or an ACL that grants it) would otherwise trust a file another user wrote with mode 0600 */
+        if (st.st_uid != geteuid()) return RBL_ERR_REFUSED;
         fd = open(path, O_RDONLY | O_NONBLOCK
 #ifdef O_CLOEXEC
                   | O_CLOEXEC
@@ -4629,7 +4633,10 @@ RBLDEF int rbl_endpoint_read(const char* path, uint16_t* port, char token_out[25
         );
         if (fd < 0) return RBL_ERR_IO;
         /* decided again on the open file: the path may have been swapped since the stat */
-        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || (st.st_mode & 077)) { close(fd); return RBL_ERR_REFUSED; }
+        if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || (st.st_mode & 077) || st.st_uid != geteuid()) {
+            close(fd);
+            return RBL_ERR_REFUSED;
+        }
         while (n < RBL_MAX_ENDPOINT_FILE + 1) {
             ssize_t r = read(fd, buf + n, RBL_MAX_ENDPOINT_FILE + 1 - n);
             if (r < 0 && errno == EINTR) continue;
