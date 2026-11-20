@@ -15,7 +15,7 @@ The standalone CMake build and Makefile default to 11.0.
 
 
 A single-header **C99** implementation of the **rewrite-bridge passthrough link protocol v1** (contract
-revision 7), so that a game mod written in C or C++ (an SKSE or F4SE plugin, a ScriptHookV script, an Unreal
+revision 8), so that a game mod written in C or C++ (an SKSE or F4SE plugin, a ScriptHookV script, an Unreal
 or other native plugin) can be a **host** or a **guest** next to any other game or rewrite that speaks it.
 The protocol is defined by `docs/CONTRACT.md` in the rewrite-bridge repository; this library is one
 implementation of it. The Rust crate, [link-java](https://github.com/patodois/link-java), [link-cs](https://github.com/patodois/link-cs)
@@ -110,12 +110,12 @@ standing in for the game's frame loop. `examples/demo.c` is the longer one, the 
 |---|---|
 | `rbl_link_host(&cfg, &link)`, `rbl_link_guest(&cfg, &link)` | Create one side. `rbl_config_init(&cfg, "My Game")` fills in the defaults (port 47800, heartbeat 250 ms, timeout 2000 ms); a `heartbeat_ms` or `timeout_ms` of 0 also means the default. |
 | `rbl_link_poll(link, events, cap)` | **Never blocks.** Does the handshake, reads both channels, sends heartbeats and at most 32 collision chunks, checks the watchdog, and writes what happened into **your** array of `rbl_event`. Returns the count. Call it every frame. |
-| `rbl_link_send_camera`, `rbl_link_send_poses`, `rbl_link_send_collision`, `rbl_link_send_frame` | State datagrams. `send_collision` copies the triangles and queues the chunks (paced, a newer snapshot replaces the queued one); the others send at once. `send_camera` returns the `seq` a guest quotes in `rbl_frame.camera_seq`. |
+| `rbl_link_send_camera`, `rbl_link_send_poses`, `rbl_link_send_collision`, `rbl_link_send_frame` | State datagrams. `send_collision` copies the triangles and queues the chunks (paced, a newer snapshot replaces the queued one); the others send at once. `send_camera` returns the `seq` a guest quotes in `rbl_frame.camera_seq`. `send_poses` keeps each entity's times in order (revision 8, below). |
 | `rbl_link_spawn`, `rbl_link_despawn`, `rbl_link_set_focus`, `rbl_link_announce_frames` | Control messages. |
 | `rbl_link_disconnect(link, reason)`, `rbl_link_close(link)` | `bye`, half-close, drain (CONTRACT 6.1). `disconnect` does not block; `close` may block for up to about 250 ms, so call it at shutdown. |
-| `rbl_link_is_connected`, `rbl_link_peer`, `rbl_link_focus`, `rbl_link_stats`, `rbl_link_control_port`, `rbl_link_udp_port` | Queries. `rbl_stats` has `malformed`, `stale`, `foreign`, `unknown_entity`, `spawn_ignored`, `send_dropped`, `datagrams_sent/received`, `lines_sent/received`, `dropped`; `foreign` counts datagrams from another address or session, and one of another protocol version counts as `malformed`. |
-| `rbl_pixel_writer_create[_temp]`, `rbl_pixel_writer_write`, `rbl_link_announce_writer`, `rbl_pixel_writer_close` | The sending side of the pixel file: created exclusively, colour and optional linear depth, seqlock. |
-| `rbl_pixel_reader_open`, `rbl_pixel_reader_read_latest`, `rbl_pixel_reader_close` | The receiving side: every revision 5 check, copies a slot into your buffers with the seqlock. Present frames with `read_latest`. Two raw calls copy without ordering: `read_frame`, for inspection and re-reading, and `read`, which is **not conformant** to contract section 9.6 (it cannot compare the datagram's size) and is kept only so that old programs build. |
+| `rbl_link_is_connected`, `rbl_link_peer`, `rbl_link_focus`, `rbl_link_stats`, `rbl_link_control_port`, `rbl_link_udp_port` | Queries. `rbl_stats` has `malformed`, `stale`, `foreign`, `unknown_entity`, `spawn_ignored`, `send_dropped`, `datagrams_sent/received`, `lines_sent/received`, `dropped`, `pose_time_raised`; `foreign` counts datagrams read from another address or session (during a session the socket is connected to the peer, so the system drops other addresses' datagrams unread), and one of another protocol version counts as `malformed`. `rbl_link_udp_port` is the port of the current or next session: with `udp_port` 0 each session gets a new one. |
+| `rbl_pixel_writer_create[_temp]`, `rbl_pixel_writer_write`, `rbl_link_announce_writer`, `rbl_pixel_writer_close` | The sending side of the pixel file: created exclusively with mode 0600, colour and optional linear depth, seqlock. On Windows the file must be on a local drive: `RBL_ERR_REFUSED` otherwise (also from `_temp` when the temp directory is not), and then announce no `frame_channel`. |
+| `rbl_pixel_reader_open`, `rbl_pixel_reader_read_latest`, `rbl_pixel_reader_close` | The receiving side: every revision 5 check and the revision 8 Windows path rule (`rbl_pixel_path_allowed`), copies a slot into your buffers with the seqlock. Present frames with `read_latest`. Two raw calls copy without ordering: `read_frame`, for inspection and re-reading, and `read`, which is **not conformant** to contract section 9.6 (it cannot compare the datagram's size) and is kept only so that old programs build. |
 | `rbl_wire_*`, `rbl_control_parse`, `rbl_control_format` | The codecs, public for tools and tests. |
 | `cfg.token`, `cfg.endpoint_file`, `rbl_generate_token`, `rbl_token_equal`, `rbl_endpoint_write`, `rbl_endpoint_read`, `rbl_endpoint_remove` | Authentication, contract revision 6 (below). |
 | `rbl_camera_look_at`, `rbl_pose_identity`, `rbl_quat_*` | Small helpers in the link's conventions (right-handed, +Y up, +Z front). |
@@ -149,7 +149,7 @@ space is taken when a page is first written, not when the file is created. If th
 at that moment, the system cannot back the page and can end the writing process with `SIGBUS` inside
 `rbl_pixel_writer_write`. Keep the temp directory on a file system with room for the file's size.
 
-## Authentication: the token and the endpoint file (contract revision 7)
+## Authentication: the token and the endpoint file (contract revision 8)
 
 A host may require a token; a guest then has to send it in its `hello`. Without one, nothing changes. Two new
 optional fields of `rbl_config` (both `NULL` after `rbl_config_init`):
@@ -179,7 +179,8 @@ bytes, so a 257-byte token that begins with a 256-byte one is not equal to it.
 
 Helpers, public for tools and tests: `rbl_generate_token(char out[65])`, `rbl_token_equal(a, alen, b, blen)` (the contract's
 constant-time method), `rbl_endpoint_write(path, port, token)`, `rbl_endpoint_read(path, &port, token_out[257])` (a regular
-file, checked before it is opened; on Unix mode `& 077` must be 0; at most 4096 bytes; strict control line JSON) and
+file, checked before it is opened; on Unix mode `& 077` must be 0 and, from revision 8, the file must belong to the effective
+user; at most 4096 bytes; strict control line JSON) and
 `rbl_endpoint_remove(path)`. The random bytes come from `getrandom` on Linux (`/dev/urandom` if it is missing),
 `arc4random_buf` on macOS and the BSDs and `BCryptGenRandom` on Windows; if the generator fails the call fails, there is
 no weaker fallback.
@@ -189,6 +190,45 @@ and a process that squats the control port before the host (the host's bind fail
 protect against processes running as the same user, or against an administrator; it authenticates the guest to the host
 only, and encrypts nothing. Contract section 6.2 has the full threat model and the recommended places for the file.
 On Windows the file has no mode bits: put it under `%LOCALAPPDATA%` and the per-user ACL of that directory does the work.
+
+## Contract revision 8
+
+All nine rules are implemented, each with tests in `tests/test_link.c` that fail against the header before the rule
+(checked by building them against the earlier commit), and the shared vectors of revision 8 pass with no known
+disagreement. Where a test cannot fail before the rule, that is said below.
+
+- **Candidates** (section 2): while no session is live, a host holds at most 4 connections that have not delivered a
+  complete first line. The first whose first line is an acceptable `hello` becomes the session and the others are
+  answered `busy`; a refused first line closes that one only (`RBL_EV_HANDSHAKE_FAILED`); a new connection that finds
+  4 closes the oldest with a `bye` of its own reason (no event), also one that has sent part of a line. A candidate
+  nothing displaces has the host's `timeout_ms` for its first line. Held candidates are read oldest first, before new
+  ones are accepted, and a new one is read as soon as it is accepted. `busy` is answered only while a session is live.
+- **Bounds per poll** (sections 2, 6.1): at most 8 connections accepted per poll (the listen backlog is 128), at most 16
+  closing sockets (one more closes the oldest at once), at most 1024 datagrams read per poll with a session and 64
+  without.
+- **Connected UDP socket** (section 2): during a session the UDP socket is connected to the peer's address and sends
+  with `send`; it is never disconnected. With `udp_port` 0 a new socket on a new port replaces it when the session
+  ends, and the next `hello` announces that port; a fixed port is connected again to the next peer. An
+  unreachable-port error is a lost datagram (that test cannot fail before the rule, which had no connected socket).
+- **Pose order** (sections 5, 7, 8, 9.4): `rbl_link_send_poses` never sends an entity a `time_us` lower than the last
+  one it sent it; such a pose goes out with the last time plus 1 us and is counted in `pose_time_raised`. A pose with
+  `RBL_POSE_TELEPORT`, and the first pose after a `spawn` of the entity, start its order again, on both sides: a
+  receiver uses a teleport whatever its time, and a spawn of a live entity forgets its last pose time.
+- **Windows pixel paths** (section 9.6, item 5): before any file call the reader accepts only `X:\...`, `X:/...` and
+  `\\?\X:\...` whose last component is not a device name, then refuses a drive that `GetDriveType` does not call
+  fixed or a RAM disk, and a handle whose final path is on a share. The writer applies the same rule, so a sender
+  whose temp directory is not local gets `RBL_ERR_REFUSED` and has no pixel channel.
+- **Numbers** (section 8, point 9): a number literal anywhere in a line is a protocol error exactly when its correctly
+  rounded double is not finite: the significant digits are compared with those of 2^1024 - 2^970.
+- **A side that was not running** (sections 6, 7): when more than a timeout passed since the previous poll, the
+  watchdog, a candidate's wait for its first line and a guest's wait for the host's `hello` start again at this
+  poll. A shorter gap counts as before (its test is a guard and passes before the rule too).
+- **Who owns the files** (sections 6.2, 9.6): the endpoint file reader refuses, on Unix, a file that does not belong
+  to the effective user. The pixel writer already created its file with mode 0600 (its test passes before too).
+- **Error texts and peer text** (sections 6.2, 8): the reason of a `bye` sent for a refused line, and the event text,
+  name the rule and the field only ("heartbeat_ms outside 10 to 10000"), never a value from the line. The peer's
+  `game`, a `spawn` name and its `bye` reason reach the application with bytes below 0x20 and 0x7F as spaces; the
+  `reason` of an `input` is not handed to the application at all.
 
 ## Contract revision 5
 
@@ -222,6 +262,9 @@ Choices that the contract leaves open, made here:
   default is the contract's limit, 925696 triangles (a configured value above it is clamped to it, since no more can
   arrive); you may lower it;
 - a `hello` with `udp_port` 0 is rejected, as the Rust and Java implementations do;
+- (revision 8) a candidate closed with `busy` or to make room gives no event; a refused or timed-out one gives
+  `RBL_EV_HANDSHAKE_FAILED`; the sender follows the pose times of at most 1024 entities at a time (as many as a peer
+  keeps), and a pose of one more is sent as given;
 - one line goes to `stderr` per session when a peer overflows the entity table (the Rust and Java ones do too).
 
 ## Embedding it in a game plugin
@@ -283,7 +326,7 @@ so a vector that this implementation fails is a place where it disagrees with th
 copy of rewrite-bridge's `tests/vectors/link/` (without `gen.py`); `README.md` and `GAPS.md` in it describe the
 formats and what the contract leaves open. Do not edit the copy.
 
-`tests/test_vectors.c` runs them (`make test`, `make asan`, or `ctest -R vectors`; about 30 seconds, most of it
+`tests/test_vectors.c` runs them (`make test`, `make asan`, or `ctest -R vectors`; about a minute, most of it
 sessions that wait on timers). It checks every file against `SHA256SUMS`, and `SHA256SUMS` itself against the
 constant `VECTORS_DIGEST` in the source, so the vectors can only change together with a deliberate edit of that
 constant. Vectors this implementation is known to fail are listed with the reason in `KNOWN_DISAGREEMENTS` at the

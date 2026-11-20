@@ -1,4 +1,4 @@
-/* rewrite_link.h - the rewrite-bridge passthrough link protocol v1 (revision 7), C99, single header.
+/* rewrite_link.h - the rewrite-bridge passthrough link protocol v1 (contract revision 8), C99, single header.
  *
  * https://github.com/patodois/link-c  -  MIT OR Apache-2.0
  *
@@ -39,6 +39,14 @@
  *     memory owned by the link. They are valid until the next call of rbl_link_poll() or
  *     rbl_link_close() on that link. Copy what you keep.
  *   - Not thread safe: use one link from one thread, or lock around every call yourself.
+ *   - What other local processes can cost a poll is bounded (contract revision 8, section 2): before a session a host
+ *     holds at most 4 connections that have not sent a complete first line (a fifth displaces the oldest, and the first
+ *     acceptable hello wins), it accepts at most 8 connections per poll and keeps at most 16 closing, and a poll reads
+ *     at most 64 datagrams without a session and 1024 with one. During a session the UDP socket is connected to the
+ *     peer, so the system drops other senders' datagrams; with udp_port 0 each session gets a new socket and port.
+ *   - A side that did not poll for longer than its timeout (stopped, or the machine slept) measures the peer's silence
+ *     from its next poll (revision 8, section 7). Polling less often than the timeout is still not conforming: the
+ *     peer hears no heartbeat.
  *
  * MEMORY (what the library allocates; everything else lives in your buffers)
  *   - rbl_link_host/guest: the link object (about 90 KiB), freed by rbl_link_close().
@@ -596,7 +604,8 @@ typedef struct rbl_pixel_frame {
 typedef struct rbl_pixel_stats { uint64_t busy, other_frame, overwritten, gone, stale; } rbl_pixel_stats;
 
 /* Opens a pixel file with bounded positional I/O on Unix, or a protected Windows map,
- * after the checks of revision 7: the path must be absolute and name a
+ * after the checks of revision 7: the path must be absolute (on Windows, revision 8: a drive-letter path on a local drive,
+ * see rbl_pixel_path_allowed, decided before any file-system call) and name a
  * regular file (a symlink, FIFO, device, directory or socket is refused; on Unix the file is
  * checked before and after it is opened, with O_NONBLOCK, and both must be the same device and
  * inode), width and height 1..16384, at most 2^26 pixels, stride == width * 4, slots 1..16, every
@@ -636,7 +645,8 @@ RBLDEF void rbl_pixel_reader_stats(const rbl_pixel_reader* r, rbl_pixel_stats* o
 RBLDEF void rbl_pixel_reader_close(rbl_pixel_reader* r);
 
 /* Creates a pixel file for writing: exclusively (an existing path gives RBL_ERR_EXISTS), sized
- * once and never resized, mode 0600, mapped read-write. width and height are 1..16384 with at
+ * once and never resized, mode 0600 from creation, mapped read-write. On Windows (revision 8) the path must be one a
+ * receiver opens, a drive-letter path on a local drive; RBL_ERR_REFUSED otherwise, and then announce no frame_channel. width and height are 1..16384 with at
  * most 2^26 pixels, slots 1..16 (3 is recommended). A relative path is made absolute against the
  * current directory. The file is sparse: on Unix a disk that is full when a page is first written
  * can end the process with SIGBUS in rbl_pixel_writer_write (nothing is preallocated). */

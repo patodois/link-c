@@ -1,7 +1,7 @@
 # Agent guide
 
 link-c implements rewrite-bridge's passthrough link protocol for C and C++ game-plugin developers.
-The single header supplies both host and guest roles for protocol v1, contract revision 7.
+The single header supplies both host and guest roles for protocol v1, contract revision 8.
 
 ## Toolchain and CI
 
