@@ -59,10 +59,6 @@
 
 /* Vectors this implementation fails: { id, why }, the list ends with { NULL, NULL }. */
 static const struct { const char* id; const char* why; } KNOWN_DISAGREEMENTS[] = {
-    { "sess.host.watchdog.own_pause_is_not_peer_silence", "revision 8 side that was not running (section 7): not yet implemented" },
-    { "sess.guest.watchdog.own_pause_is_not_peer_silence", "revision 8 side that was not running (section 7): not yet implemented" },
-    { "sess.guest.handshake.own_pause_keeps_the_wait_for_hello", "revision 8 side that was not running (section 7): not yet implemented" },
-    { "sess.host.handshake.own_pause_keeps_the_candidate", "revision 8 side that was not running (section 7): not yet implemented" },
     { NULL, NULL }
 };
 

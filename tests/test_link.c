@@ -1332,6 +1332,109 @@ TEST(watchdog_loses_a_silent_guest) {
     rbl_link_close(host);
 }
 
+/* ---- revision 8: a side that was not running (contract sections 6 and 7) ---- */
+
+TEST(a_pause_of_this_side_longer_than_the_timeout_is_not_the_peers_silence) {
+    rbl_config h;
+    rbl_link* host;
+    Col c;
+    Raw r;
+    char line[400];
+    uint64_t t0;
+    int ok;
+    memset(&c, 0, sizeof c);
+    rbl_config_init(&h, "Watch Host"); h.control_port = 0; h.timeout_ms = 400; h.heartbeat_ms = 100;
+    REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
+    REQUIRE(raw_open(&r, rbl_link_control_port(host)));
+    hello_line(line, sizeof line, "guest", 1, 1, r.udp_port, 50); /* timeout max(400, 200) */
+    raw_send(&r, line);
+    REQUIRE(raw_wait_line(&r, host, &c, 2000, line, sizeof line));
+    REQUIRE(rbl_link_is_connected(host));
+    rbli_sleep_ms(1000); /* the host is not polled: as if its process had been stopped */
+    t0 = rbli_mono_ms();
+    WAIT_UNTIL(250, col_poll(host, &c), c.lost > 0, ok);
+    CHECK(!ok); /* the silence counts from the first poll after the pause */
+    WAIT_UNTIL(1500, col_poll(host, &c), c.lost > 0, ok);
+    CHECK(ok); /* and the peer, which stays silent, is lost a whole timeout later */
+    CHECK(rbli_mono_ms() - t0 >= 380);
+    raw_close(&r);
+    rbl_link_close(host);
+}
+
+TEST(a_pause_shorter_than_the_timeout_counts_as_silence) {
+    rbl_config h;
+    rbl_link* host;
+    Col c;
+    Raw r;
+    char line[400];
+    int ok;
+    memset(&c, 0, sizeof c);
+    rbl_config_init(&h, "Watch Host"); h.control_port = 0; h.timeout_ms = 1000; h.heartbeat_ms = 100;
+    REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
+    REQUIRE(raw_open(&r, rbl_link_control_port(host)));
+    hello_line(line, sizeof line, "guest", 1, 1, r.udp_port, 10);
+    raw_send(&r, line);
+    REQUIRE(raw_wait_line(&r, host, &c, 2000, line, sizeof line));
+    WAIT_UNTIL(700, col_poll(host, &c), 0, ok);
+    rbli_sleep_ms(600); /* 1300 ms of silence at the next poll, the gap itself below the timeout */
+    col_poll(host, &c);
+    CHECK_EQ(c.lost, 1);
+    raw_close(&r);
+    rbl_link_close(host);
+}
+
+TEST(a_pause_keeps_a_hosts_candidate_and_a_guests_wait_for_hello) {
+    rbl_config h, g;
+    rbl_link* host;
+    rbl_link* guest;
+    Col c;
+    rbli_sock s, listener, acc = RBLI_BAD_SOCK;
+    uint16_t port, udp;
+    rbli_sock u = rbli_udp_open(0, &udp);
+    char line[400];
+    int ok;
+    REQUIRE(u != RBLI_BAD_SOCK);
+    /* host: a candidate accepted before the pause still has the whole timeout after it */
+    memset(&c, 0, sizeof c);
+    rbl_config_init(&h, "H"); h.control_port = 0; h.timeout_ms = 400;
+    REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
+    s = tcp_to(rbl_link_control_port(host));
+    REQUIRE(s != RBLI_BAD_SOCK);
+    WAIT_UNTIL(50, col_poll(host, &c), 0, ok);
+    CHECK_EQ(host->ncand, 1);
+    rbli_sleep_ms(1000);
+    col_poll(host, &c);
+    CHECK_EQ(host->ncand, 1);
+    hello_line(line, sizeof line, "guest", 1, 1, udp, 250);
+    CHECK_EQ(rbli_tcp_send(s, line, strlen(line)), (int)strlen(line));
+    WAIT_UNTIL(300, col_poll(host, &c), c.connected > 0 || c.hsfail > 0, ok);
+    CHECK(ok && c.connected == 1 && c.hsfail == 0);
+    rbli_sock_close(s);
+    rbl_link_close(host);
+    /* guest: its wait for the host's hello starts again too */
+    memset(&c, 0, sizeof c);
+    listener = rbli_tcp_listen(0, &port);
+    REQUIRE(listener != RBLI_BAD_SOCK);
+    rbl_config_init(&g, "G"); g.control_port = port; g.timeout_ms = 400;
+    REQUIRE(rbl_link_guest(&g, &guest) == RBL_OK);
+    WAIT_UNTIL(1000, col_poll(guest, &c), (acc = rbli_tcp_accept(listener)) != RBLI_BAD_SOCK, ok);
+    REQUIRE(ok);
+    WAIT_UNTIL(100, col_poll(guest, &c), guest->state == RBLI_HANDSHAKE, ok);
+    REQUIRE(ok);
+    rbli_sleep_ms(1000);
+    col_poll(guest, &c);
+    CHECK_EQ(c.hsfail, 0);
+    snprintf(line, sizeof line, "{\"type\":\"hello\",\"role\":\"host\",\"game\":\"h\",\"protocol\":1,\"min_protocol\":1,\"udp_port\":%u,"
+             "\"heartbeat_ms\":250,\"timeout_ms\":2000,\"session\":7}\n", (unsigned)udp);
+    CHECK_EQ(rbli_tcp_send(acc, line, strlen(line)), (int)strlen(line));
+    WAIT_UNTIL(300, col_poll(guest, &c), c.connected > 0 || c.hsfail > 0, ok);
+    CHECK(ok && c.connected == 1 && c.hsfail == 0);
+    rbl_link_close(guest);
+    rbli_sock_close(acc);
+    rbli_sock_close(listener);
+    rbli_sock_close(u);
+}
+
 TEST(bye_is_delivered_and_the_close_is_clean_while_the_closer_has_unread_data) {
     /* CONTRACT.md 6.1: close after bye = half-close, drain, close; a socket closed with unread data makes the OS send a reset */
     rbl_config h;
@@ -3461,6 +3564,9 @@ int main(void) {
     RUN(hello_with_wrong_role_protocol_or_garbage_gets_bye);
     RUN(a_peers_reason_reaches_the_event_without_control_characters);
     RUN(watchdog_loses_a_silent_guest);
+    RUN(a_pause_of_this_side_longer_than_the_timeout_is_not_the_peers_silence);
+    RUN(a_pause_shorter_than_the_timeout_counts_as_silence);
+    RUN(a_pause_keeps_a_hosts_candidate_and_a_guests_wait_for_hello);
     RUN(bye_is_delivered_and_the_close_is_clean_while_the_closer_has_unread_data);
     RUN(close_returns_within_the_linger_even_if_the_peer_never_closes);
     RUN(a_bye_that_arrived_wins_over_a_later_control_write_error);

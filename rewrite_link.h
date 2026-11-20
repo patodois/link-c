@@ -2174,6 +2174,7 @@ struct rbl_link {
     int ncand;
     rbl_peer_info peer;  /* LIVE */
     uint64_t timeout_ms, last_heard, last_beat;
+    uint64_t last_poll;  /* revision 8: when rbl_link_poll last ran, to tell a pause of this side from the peer's silence */
 
     rbli_closing closing[RBLI_MAX_CLOSING];
     int nclosing;
@@ -3326,6 +3327,7 @@ static int rbli_link_create(const rbl_config* cfg, rbl_role role, rbl_link** out
     l->ctl.sock = RBLI_BAD_SOCK;
     l->state = RBLI_IDLE;
     l->next_try = rbli_mono_ms();
+    l->last_poll = l->next_try;
     l->next_query = 1;
     l->focus = RBL_ROLE_HOST;
     if (rbli_net_up() != 0) { REWRITE_LINK_FREE(l); return RBL_ERR_IO; }
@@ -3403,6 +3405,21 @@ static int rbli_link_create(const rbl_config* cfg, rbl_role role, rbl_link** out
 RBLDEF int rbl_link_host(const rbl_config* cfg, rbl_link** out) { return rbli_link_create(cfg, RBL_ROLE_HOST, out); }
 RBLDEF int rbl_link_guest(const rbl_config* cfg, rbl_link** out) { return rbli_link_create(cfg, RBL_ROLE_GUEST, out); }
 
+/* Revision 8 (sections 6 and 7): a side that finds more than a timeout between two of its own polls was not running (stopped,
+ * in a debugger, a machine that slept: CLOCK_MONOTONIC counts sleep on macOS) and cannot judge the other side's silence by
+ * that timeout. Every wait by which it judges the other side starts again at this poll: the watchdog, a host's wait for a
+ * candidate's first line and a guest's wait for the host's hello. A shorter gap counts as it always did. */
+static void rbli_after_a_pause(rbl_link* l, uint64_t now) {
+    uint64_t gap = now - l->last_poll;
+    int i;
+    l->last_poll = now;
+    if (gap > l->cfg.timeout_ms) {
+        for (i = 0; i < l->ncand; i++) l->cand[i].since = now;
+        if (l->state == RBLI_HANDSHAKE) l->since = now;
+    }
+    if (l->state == RBLI_LIVE && gap > l->timeout_ms) l->last_heard = now;
+}
+
 RBLDEF int rbl_link_poll(rbl_link* l, rbl_event* events, size_t cap) {
     uint64_t now;
     size_t n;
@@ -3417,6 +3434,7 @@ RBLDEF int rbl_link_poll(rbl_link* l, rbl_event* events, size_t cap) {
         l->pending_type = 0;
     }
     now = rbli_mono_ms();
+    rbli_after_a_pause(l, now);
     rbli_closing_pump_all(l, now);
     rbli_poll_connect(l, now);
     rbli_poll_control(l, now);
