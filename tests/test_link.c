@@ -2309,6 +2309,74 @@ TEST(review_heartbeat_ms_outside_10_to_10000_is_a_handshake_error) {
     }
 }
 
+/* Revision 8 (section 8, bye): the bye a host sends for a refused hello, and the event it reports, are fixed texts that
+ * quote nothing from the line, not even the value that broke the rule. */
+TEST(a_refused_hello_is_answered_with_a_text_that_quotes_nothing_from_it) {
+    static const struct { const char* line; const char* marker; } cases[] = {
+        {"{\"type\":\"hello\",\"role\":\"guest\",\"game\":\"x\",\"protocol\":1,\"min_protocol\":1,\"udp_port\":5,\"heartbeat_ms\":98765,\"timeout_ms\":2000}\n", "98765"},
+        {"{\"type\":\"hello\",\"role\":\"guest\",\"game\":\"x\",\"protocol\":4321,\"min_protocol\":4321,\"udp_port\":5,\"heartbeat_ms\":250,\"timeout_ms\":2000}\n", "4321"},
+        {"{\"type\":\"hello\",\"role\":\"guest\",\"game\":\"x\",\"protocol\":1,\"min_protocol\":1,\"udp_port\":5,\"heartbeat_ms\":250,\"timeout_ms\":2000,\"Zq7xKEY\" 1}\n", "Zq7x"},
+        {"{\"type\":\"hello\",\"role\":\"guest\",\"game\":\"x\",\"protocol\":1,\"min_protocol\":1,\"udp_port\":5,\"heartbeat_ms\":250,\"timeout_ms\":2000,\"token\":@Zq7x@}\n", "Zq7x"},
+        {"{\"type\":\"hello\",\"role\":\"guest\",\"game\":\"x\",\"protocol\":1,\"min_protocol\":1,\"udp_port\":0,\"heartbeat_ms\":250,\"timeout_ms\":2000}\n", " 0"},
+    };
+    size_t i;
+    for (i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        rbl_config h;
+        rbl_link* host;
+        Col c;
+        Raw r;
+        char line[400];
+        int ok;
+        memset(&c, 0, sizeof c);
+        rbl_config_init(&h, "H"); h.control_port = 0;
+        REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
+        REQUIRE(raw_open(&r, rbl_link_control_port(host)));
+        raw_send(&r, cases[i].line);
+        REQUIRE(raw_wait_line(&r, host, &c, 3000, line, sizeof line));
+        WAIT_UNTIL(1000, col_poll(host, &c), c.hsfail > 0, ok);
+        CHECK(ok);
+        CHECK(strncmp(line, "{\"type\":\"bye\"", 13) == 0);
+        if (strstr(line, cases[i].marker) || strstr(c.hsfail_reason, cases[i].marker)) {
+            char m[700];
+            snprintf(m, sizeof m, "\"%s\" quoted: bye %s, event \"%s\"", cases[i].marker, line, c.hsfail_reason);
+            t_fail(__FILE__, __LINE__, m);
+        }
+        raw_close(&r);
+        rbl_link_close(host);
+    }
+}
+
+/* Revision 8 (section 8, bye): the game of the peer's hello and the name of its spawn reach the application with every byte
+ * below 0x20 and 0x7F as a space; provider and asset are identifiers and arrive as sent. */
+TEST(the_peers_game_and_spawn_name_reach_the_application_without_control_characters) {
+    rbl_config h;
+    rbl_link* host;
+    Col c;
+    Raw r;
+    char line[400];
+    rbl_peer_info pi;
+    int ok;
+    memset(&c, 0, sizeof c);
+    rbl_config_init(&h, "H"); h.control_port = 0;
+    REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
+    REQUIRE(raw_open(&r, rbl_link_control_port(host)));
+    snprintf(line, sizeof line, "{\"type\":\"hello\",\"role\":\"guest\",\"game\":\"g\\u001b]0;x\\u0007h\\nk\\u007f\",\"protocol\":1,"
+             "\"min_protocol\":1,\"udp_port\":%u,\"heartbeat_ms\":250,\"timeout_ms\":2000}\n", (unsigned)r.udp_port);
+    raw_send(&r, line);
+    WAIT_UNTIL(2000, col_poll(host, &c), c.connected > 0, ok);
+    REQUIRE(ok);
+    REQUIRE(rbl_link_peer(host, &pi));
+    CHECK_STR(pi.game, "g ]0;x h k ");
+    raw_send(&r, "{\"type\":\"spawn\",\"entity\":5,\"provider\":\"P\\t1\",\"asset\":\"a\\n\",\"name\":\"n\\u001b[0m\\r\\nx\"}\n");
+    WAIT_UNTIL(2000, (col_poll(host, &c), raw_pump(&r)), c.spawns > 0, ok);
+    REQUIRE(ok);
+    CHECK_STR(c.last_spawn_name, "n [0m  x");
+    CHECK_STR(c.last_spawn_provider, "P\t1");
+    CHECK_STR(c.last_spawn_asset, "a\n");
+    raw_close(&r);
+    rbl_link_close(host);
+}
+
 TEST(announce_frames_sends_a_frame_channel_line_and_the_file_reads) {
     Pair p;
     char path[512];
@@ -3079,6 +3147,8 @@ int main(void) {
     RUN(review_unknown_entity_and_spawn_ignored_counters);
     RUN(review_our_own_heartbeat_is_within_what_a_hello_may_announce);
     RUN(review_heartbeat_ms_outside_10_to_10000_is_a_handshake_error);
+    RUN(a_refused_hello_is_answered_with_a_text_that_quotes_nothing_from_it);
+    RUN(the_peers_game_and_spawn_name_reach_the_application_without_control_characters);
     RUN(announce_frames_sends_a_frame_channel_line_and_the_file_reads);
     RUN(a_control_line_with_a_nul_escape_is_a_protocol_error);
     RUN(poll_with_a_small_array_loses_nothing);

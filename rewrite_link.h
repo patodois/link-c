@@ -452,7 +452,7 @@ typedef struct rbl_config {
 RBLDEF void rbl_config_init(rbl_config* cfg, const char* game);
 
 typedef struct rbl_peer_info {
-    char game[128];              /* the peer's game, cut to fit */
+    char game[128];              /* the peer's game, cut to fit; bytes below 0x20 and 0x7F are spaces (revision 8) */
     rbl_role role;
     uint32_t protocol;           /* the session version */
     uint32_t session;
@@ -489,7 +489,8 @@ typedef struct rbl_event {
         struct { uint32_t query; float center[3]; float radius; const rbl_triangle* triangles;
                  uint32_t triangle_count; } collision;
         struct { rbl_header header; rbl_frame frame; } frame;
-        struct { uint32_t entity; const char* provider; const char* asset; const char* name; /* NULL if none */ } spawn;
+        /* name: NULL if none; bytes below 0x20 and 0x7F are spaces (revision 8). provider and asset are as sent. */
+        struct { uint32_t entity; const char* provider; const char* asset; const char* name; } spawn;
         struct { uint32_t entity; } despawn;
         /* host: the guest REQUESTS the focus (requested = 1); guest: the host SET it (requested = 0) */
         struct { rbl_role focus; int requested; } focus;
@@ -2252,6 +2253,15 @@ static void rbli_copy_text(char* dst, size_t cap, const char* s, size_t n) {
     dst[n] = 0;
 }
 
+/* Revision 8 (section 8, bye): text from the peer that is meant for people (the game of its hello, the name of a spawn, the
+ * reason of its bye) reaches the application with every byte below 0x20 and the byte 0x7F replaced by a space, so a peer
+ * cannot write a forged log line or a terminal escape through it. Those bytes are never part of a longer UTF-8 character,
+ * so the text stays valid UTF-8. Identifiers (provider, asset, path) are handed on as sent. */
+static void rbli_clean_text(char* p) {
+    for (; *p; p++)
+        if ((unsigned char)*p < 0x20 || *p == 0x7F) *p = ' ';
+}
+
 /* ---- events ---- */
 
 static rbl_event* rbli_ev_push(rbl_link* l, rbl_event_type t) {
@@ -2267,13 +2277,11 @@ static rbl_event* rbli_ev_push(rbl_link* l, rbl_event_type t) {
  * poll always has its place. */
 static int rbli_room(const rbl_link* l) { return l->ev && l->ev_n + 1 < l->ev_cap; }
 
-/* The text of an end event. It can quote a peer that never authenticated (a bye before the hello), so every byte below
- * 0x20 and 0x7F becomes a space: an application that logs the text gets one line and no terminal escapes. */
+/* The text of an end event. It can carry the reason of a peer that never authenticated (a bye before the hello), so it is
+ * cleaned like all text from the peer: an application that logs the text gets one line and no terminal escapes. */
 static void rbli_copy_reason(rbl_reason* out, const char* reason) {
-    char* p;
     rbli_copy_text(out->text, sizeof out->text, reason, strlen(reason));
-    for (p = out->text; *p; p++)
-        if ((unsigned char)*p < 0x20 || *p == 0x7F) *p = ' ';
+    rbli_clean_text(out->text);
 }
 
 static void rbli_report_end(rbl_link* l, int was_live, const char* reason) {
@@ -2708,29 +2716,29 @@ static int rbli_on_hello(rbl_link* l, const rbl_control* c, uint64_t now, char* 
             return 1;
         }
     }
+    /* revision 8 (section 8, bye): the reasons below are fixed texts. They name the rule and the field, never a value of the
+     * line, so a refused line cannot put any of its bytes into the bye or into the event. */
     if (c->u.hello.role != expected) {
-        snprintf(reason, rcap, "peer claims role %s", c->u.hello.role == RBL_ROLE_HOST ? "host" : "guest");
+        snprintf(reason, rcap, "%s", expected == RBL_ROLE_GUEST ? "role is not guest" : "role is not host");
         return 1;
     }
-    if (c->u.hello.udp_port == 0) { snprintf(reason, rcap, "peer announced udp_port 0"); return 1; }
+    if (c->u.hello.udp_port == 0) { snprintf(reason, rcap, "udp_port outside 1 to 65535"); return 1; }
     if (c->u.hello.heartbeat_ms < RBL_MIN_HEARTBEAT_MS || c->u.hello.heartbeat_ms > RBL_MAX_HEARTBEAT_MS) {
-        snprintf(reason, rcap, "peer announced heartbeat_ms %lu, outside %d..%d", (unsigned long)c->u.hello.heartbeat_ms,
-                 RBL_MIN_HEARTBEAT_MS, RBL_MAX_HEARTBEAT_MS);
+        snprintf(reason, rcap, "heartbeat_ms outside 10 to 10000");
         return 1;
     }
     if (l->role == RBL_ROLE_HOST) {
         int v = rbl_negotiate(RBL_MIN_VERSION, RBL_VERSION, (int)c->u.hello.min_protocol, (int)c->u.hello.protocol);
         uint8_t r[4];
         if (v < 0) {
-            snprintf(reason, rcap, "unsupported protocol: peer %lu..%lu, ours %d..%d", (unsigned long)c->u.hello.min_protocol,
-                     (unsigned long)c->u.hello.protocol, RBL_MIN_VERSION, RBL_VERSION);
+            snprintf(reason, rcap, "unsupported protocol: the version ranges do not overlap");
             return 1;
         }
         protocol = (uint32_t)v;
         do { rbli_random(r, 4); session = rbli_get32(r); } while (session == 0);
     } else {
         if (c->u.hello.protocol < RBL_MIN_VERSION || c->u.hello.protocol > RBL_VERSION) {
-            snprintf(reason, rcap, "host chose unsupported protocol %lu", (unsigned long)c->u.hello.protocol);
+            snprintf(reason, rcap, "unsupported protocol: the host chose a version outside this side's range");
             return 1;
         }
         if (!c->u.hello.has_session || c->u.hello.session == 0) {
@@ -2754,6 +2762,7 @@ static int rbli_on_hello(rbl_link* l, const rbl_control* c, uint64_t now, char* 
     rbli_reset_session(l);
     memset(&l->peer, 0, sizeof l->peer);
     rbli_copy_text(l->peer.game, sizeof l->peer.game, g->ptr, g->len);
+    rbli_clean_text(l->peer.game); /* text for people: no control characters reach the application (revision 8) */
     l->peer.role = c->u.hello.role;
     l->peer.protocol = protocol;
     l->peer.session = session;
@@ -2821,6 +2830,7 @@ static int rbli_on_line(rbl_link* l, char* line, size_t len, uint64_t now, char*
             char* name = m.u.spawn.has_name ? rbli_arena_str(l, m.u.spawn.name) : NULL;
             rbl_event* e;
             if (!provider || !asset || (m.u.spawn.has_name && !name)) { l->stats.dropped++; return 0; }
+            if (name) rbli_clean_text(name); /* text for people (revision 8); provider and asset are identifiers, as sent */
             e = rbli_ev_push(l, RBL_EV_SPAWN);
             if (e) {
                 e->u.spawn.entity = m.u.spawn.entity;

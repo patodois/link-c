@@ -76,11 +76,6 @@ static const struct { const char* id; const char* why; } KNOWN_DISAGREEMENTS[] =
     { "sess.guest.watchdog.own_pause_is_not_peer_silence", "revision 8 side that was not running (section 7): not yet implemented" },
     { "sess.host.handshake.own_pause_keeps_the_candidate", "revision 8 candidates and bounds (section 2): not yet implemented" },
     { "sess.guest.handshake.own_pause_keeps_the_wait_for_hello", "revision 8 side that was not running (section 7): not yet implemented" },
-    { "sess.host.handshake.bad_heartbeat_value_not_echoed", "revision 8 fixed error texts (section 8, bye): not yet implemented" },
-    { "sess.host.handshake.version_values_not_echoed", "revision 8 fixed error texts (section 8, bye): not yet implemented" },
-    { "sess.guest.handshake.host_version_not_echoed", "revision 8 fixed error texts (section 8, bye): not yet implemented" },
-    { "sess.host.handshake.game_control_characters_replaced", "revision 8 cleaned peer text (section 8, bye): not yet implemented" },
-    { "sess.host.control.spawn_name_control_characters_replaced", "revision 8 cleaned peer text (section 8, bye): not yet implemented" },
     { NULL, NULL }
 };
 
