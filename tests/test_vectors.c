@@ -55,10 +55,35 @@
  *     scripts/sync-link-vectors.sh <path of this repository>
  * (it copies the directory and prints "VECTORS_DIGEST = <hex>"), paste the hex here, then run `make test`
  * and re-check KNOWN_DISAGREEMENTS. */
-#define VECTORS_DIGEST "07cf745d30318403b1808b974f050914db061d78a4351683e0c20fc0284ceab8"
+#define VECTORS_DIGEST "89fc38b3aaf18e095cc14e12bc8f008d3d54d0087bca48b202b81ebe5871f24f"
 
 /* Vectors this implementation fails: { id, why }, the list ends with { NULL, NULL }. */
 static const struct { const char* id; const char* why; } KNOWN_DISAGREEMENTS[] = {
+    { "ctl.json.number_rounds_to_largest_double_17_digits", "revision 8 numbers (section 8, point 9): not yet implemented" },
+    { "ctl.json.number_rounds_to_largest_double_19_digits", "revision 8 numbers (section 8, point 9): not yet implemented" },
+    { "ctl.json.number_one_below_halfway_integer", "revision 8 numbers (section 8, point 9): not yet implemented" },
+    { "sess.host.handshake.silent_candidate_does_not_hold_the_handshake", "revision 8 candidates and bounds (section 2): not yet implemented" },
+    { "sess.host.token.silent_candidate_does_not_hold_a_token_host", "revision 8 candidates and bounds (section 2): not yet implemented" },
+    { "sess.host.handshake.refused_candidate_leaves_the_others", "revision 8 candidates and bounds (section 2): not yet implemented" },
+    { "sess.host.handshake.fifth_connection_displaces_the_oldest", "revision 8 candidates and bounds (section 2): not yet implemented" },
+    { "sess.host.handshake.displaced_candidate_is_the_oldest", "revision 8 candidates and bounds (section 2): not yet implemented" },
+    { "sess.host.handshake.partial_line_does_not_protect_a_candidate", "revision 8 candidates and bounds (section 2): not yet implemented" },
+    { "sess.host.flood.session_survives_a_connection_flood", "revision 8 candidates and bounds (section 2): not yet implemented" },
+    { "sess.host.flood.guest_gets_in_after_a_flood", "revision 8 candidates and bounds (section 2): not yet implemented" },
+    { "sess.host.udp.pose_teleport_older_time_is_used", "revision 8 pose order (sections 5, 7, 9.4): not yet implemented" },
+    { "sess.host.udp.pose_after_respawn_any_time_is_used", "revision 8 pose order (sections 5, 7, 9.4): not yet implemented" },
+    { "sess.host.udp.pose_far_future_then_teleport_recovers", "revision 8 pose order (sections 5, 7, 9.4): not yet implemented" },
+    { "sess.guest.udp.pose_teleport_older_time_is_used", "revision 8 pose order (sections 5, 7, 9.4): not yet implemented" },
+    { "sess.host.sends.pose_time_never_goes_back", "revision 8 pose order (sections 5, 7, 9.4): not yet implemented" },
+    { "sess.host.watchdog.own_pause_is_not_peer_silence", "revision 8 side that was not running (section 7): not yet implemented" },
+    { "sess.guest.watchdog.own_pause_is_not_peer_silence", "revision 8 side that was not running (section 7): not yet implemented" },
+    { "sess.host.handshake.own_pause_keeps_the_candidate", "revision 8 candidates and bounds (section 2): not yet implemented" },
+    { "sess.guest.handshake.own_pause_keeps_the_wait_for_hello", "revision 8 side that was not running (section 7): not yet implemented" },
+    { "sess.host.handshake.bad_heartbeat_value_not_echoed", "revision 8 fixed error texts (section 8, bye): not yet implemented" },
+    { "sess.host.handshake.version_values_not_echoed", "revision 8 fixed error texts (section 8, bye): not yet implemented" },
+    { "sess.guest.handshake.host_version_not_echoed", "revision 8 fixed error texts (section 8, bye): not yet implemented" },
+    { "sess.host.handshake.game_control_characters_replaced", "revision 8 cleaned peer text (section 8, bye): not yet implemented" },
+    { "sess.host.control.spawn_name_control_characters_replaced", "revision 8 cleaned peer text (section 8, bye): not yet implemented" },
     { NULL, NULL }
 };
 
@@ -668,6 +693,42 @@ static JV load_doc(const char* name) { /* the "cases" array of one vector file, 
     return cases;
 }
 
+/* ------------------------------------------------------------------ platforms (revision 8) */
+
+/* The platform names this runner answers to in a case's `only_on` and `skip_on`. */
+static const char* const* platform_names(void) {
+#if RBLI_WINDOWS
+    static const char* const names[] = { "windows", NULL };
+#elif defined(__APPLE__)
+    static const char* const names[] = { "unix", "macos", NULL };
+#elif defined(__linux__)
+    static const char* const names[] = { "unix", "linux", NULL };
+#else
+    static const char* const names[] = { "unix", NULL };
+#endif
+    return names;
+}
+
+/* Whether a list of platform names (a JSON array) names one of this runner's names. */
+static int names_here(const JV* list) {
+    const char* const* names = platform_names();
+    size_t i, k;
+    for (i = 0; list && list->t == J_ARR && i < list->n; i++)
+        for (k = 0; names[k]; k++)
+            if (list->v[i].t == J_STR && strcmp(list->v[i].s, names[k]) == 0) return 1;
+    return 0;
+}
+
+/* 1 (and the reason in g_err) when the case does not run here: its `only_on` names none of this platform's names, or
+ * its `skip_on` names one. Any case of any file may have either list. */
+static int not_here(const JV* c) {
+    const JV* only = jv_get(c, "only_on");
+    const JV* skip = jv_get(c, "skip_on");
+    if (only && !names_here(only)) { failf("only on other platforms"); return 1; }
+    if (skip && names_here(skip)) { failf("not on %s", platform_names()[0]); return 1; }
+    return 0;
+}
+
 /* ------------------------------------------------------------------ report */
 
 typedef struct { char** v; size_t n, cap; } SL;
@@ -992,7 +1053,7 @@ static void test_control(const JV* cases) {
     Report r;
     size_t i;
     memset(&r, 0, sizeof r);
-    for (i = 0; i < cases->n; i++) record(&r, &cases->v[i], check_control(&cases->v[i]));
+    for (i = 0; i < cases->n; i++) record(&r, &cases->v[i], not_here(&cases->v[i]) ? 2 : check_control(&cases->v[i]));
     finish(&r, "control.json");
 }
 
@@ -1241,7 +1302,7 @@ static void test_datagrams(const JV* cases) {
     Report r;
     size_t i;
     memset(&r, 0, sizeof r);
-    for (i = 0; i < cases->n; i++) record(&r, &cases->v[i], check_datagram(&cases->v[i]));
+    for (i = 0; i < cases->n; i++) record(&r, &cases->v[i], not_here(&cases->v[i]) ? 2 : check_datagram(&cases->v[i]));
     finish(&r, "datagrams.json");
 }
 
@@ -1512,6 +1573,20 @@ static int check_pixel_reader(const JV* c) {
         temp_path(&t, "fifo.frames", open_path, sizeof open_path);
         if (mkfifo(open_path, 0600) != 0) ret = failf("cannot create a FIFO");
 #endif
+    } else if (strcmp(pk, "literal") == 0) {
+        /* revision 8 (Windows paths, section 9.6 item 5): exactly the case's `path`, which names nothing of the runner's */
+        snprintf(open_path, sizeof open_path, "%s", jstr(c, "path"));
+    } else if (strcmp(pk, "verbatim_drive") == 0 || strcmp(pk, "forward_slashes") == 0) {
+        /* revision 8: a valid copy, named by its absolute path in the \\?\X:\ form, or with every \ written as / */
+        if (!file || copy_file(fixture, path) != 0) ret = failf("cannot copy the fixture");
+        else if (strcmp(pk, "verbatim_drive") == 0) {
+            if (strncmp(path, "\\\\?\\", 4) == 0) snprintf(open_path, sizeof open_path, "%s", path);
+            else snprintf(open_path, sizeof open_path, "\\\\?\\%s", path);
+        } else {
+            char* q;
+            snprintf(open_path, sizeof open_path, "%s", path);
+            for (q = open_path; *q; q++) if (*q == '\\') *q = '/';
+        }
     } else {
         format_error("unknown path_kind", pk);
         ret = failf("bad vector");
@@ -1519,7 +1594,16 @@ static int check_pixel_reader(const JV* c) {
     if (skipped) { failf("%s cannot be created on this platform", pk); temp_drop(&t); return 2; }
     if (ret) { temp_drop(&t); return ret; }
 
-    rc = rbl_pixel_reader_open(open_path, &rd);
+    {   /* revision 8: `max_ms` bounds the wall time of the call that opens the file */
+        uint64_t began = rbli_mono_ms(), took;
+        rc = rbl_pixel_reader_open(open_path, &rd);
+        took = rbli_mono_ms() - began;
+        if (jv_get(c, "max_ms") && took > ju32k(c, "max_ms")) {
+            if (rc == RBL_OK) rbl_pixel_reader_close(rd);
+            temp_drop(&t);
+            return failf("opening took %llu ms, more than %u ms", (unsigned long long)took, ju32k(c, "max_ms"));
+        }
+    }
     if (strcmp(open, "refused") == 0) {
         if (rc == RBL_OK) { rbl_pixel_reader_close(rd); ret = failf("opened the file (%s)", jstr_or(c, "why", "")); }
     } else if (strcmp(open, "ok") == 0) {
@@ -1588,6 +1672,15 @@ static int check_pixel_writer(const JV* c) {
     }
     rc = rbl_pixel_writer_create(path, width, height, slots, with_depth, &wr);
     if (rc != RBL_OK) { temp_drop(&t); return failf("create failed: %s", rbl_strerror(rc)); }
+#if !RBLI_WINDOWS
+    if (jv_get(c, "file_mode")) { /* revision 8: the permission bits as created, before any write (the umask is left as it is) */
+        struct stat st;
+        unsigned mode = (unsigned)strtoul(jstr(c, "file_mode"), NULL, 8);
+        if (stat(path, &st) != 0) ret = failf("cannot stat the new file");
+        else if (((unsigned)st.st_mode & 0777u) != mode)
+            ret = failf("the file was created with mode %03o, expected %s", (unsigned)st.st_mode & 0777u, jstr(c, "file_mode"));
+    }
+#endif
     for (i = 0; i < writes->n && !ret; i++) {
         const JV* wj = &writes->v[i];
         const char* hs = jstr(wj, "rgba");
@@ -1637,19 +1730,9 @@ static void test_pixel_readers(const JV* cases) {
     memset(&r, 0, sizeof r);
     for (i = 0; i < cases->n; i++) {
         const JV* c = &cases->v[i];
-        const JV* so;
-        int skip = 0;
-        size_t k;
         if (jv_get(c, "writer")) continue;
         if (jis(c, "large", 0) && skip_large()) { failf("large"); record(&r, c, 2); continue; }
-        so = jv_get(c, "skip_on");
-        for (k = 0; so && k < so->n; k++) {
-#if RBLI_WINDOWS
-            if (so->v[k].t == J_STR && strcmp(so->v[k].s, "windows") == 0) skip = 1;
-#endif
-        }
-        if (skip) { failf("windows"); record(&r, c, 2); continue; }
-        record(&r, c, check_pixel_reader(c));
+        record(&r, c, not_here(c) ? 2 : check_pixel_reader(c));
     }
     finish(&r, "pixelfiles.json (readers)");
 }
@@ -1658,14 +1741,15 @@ static void test_pixel_writers(const JV* cases) {
     Report r;
     size_t i;
     memset(&r, 0, sizeof r);
-    for (i = 0; i < cases->n; i++) if (jv_get(&cases->v[i], "writer")) record(&r, &cases->v[i], check_pixel_writer(&cases->v[i]));
+    for (i = 0; i < cases->n; i++)
+        if (jv_get(&cases->v[i], "writer")) record(&r, &cases->v[i], not_here(&cases->v[i]) ? 2 : check_pixel_writer(&cases->v[i]));
     finish(&r, "pixelfiles.json (writers)");
 }
 
 /* ------------------------------------------------------------------ sessions.json */
 
 #define STEP_WAIT_MS 3000u
-#define MAX_CONNS 8
+#define MAX_CONNS 64 /* connect_many opens 40 */
 #define MAX_VARS 16
 
 typedef struct { char name[16]; int used; rbli_sock sock; uint8_t* buf; size_t len, cap; int eof; } Raw;
@@ -1679,7 +1763,7 @@ typedef struct {
     size_t nev, capev;
     Raw conns[MAX_CONNS];
     rbli_sock listener, udp, other;
-    uint16_t peer_udp, ut_udp;
+    uint16_t peer_udp, ut_udp; /* ut_udp: the UT's port at creation, then the one its latest captured hello announced */
     Var vars[MAX_VARS];
     const JV* dgrams; /* the cases of datagrams.json, for `like` */
 } Sess;
@@ -1786,8 +1870,9 @@ static void take_event(Sess* s, const rbl_event* e) {
         jv_set(&o, "heartbeat_ms", jv_num(e->u.connected.heartbeat_ms, 1));
         ev_push(s, "connected", o);
         break;
-    case RBL_EV_LOST: ev_push(s, "lost", o); break;
-    case RBL_EV_HANDSHAKE_FAILED: ev_push(s, "handshake_failed", o); break;
+    /* the reason is not specified, so no vector matches it; `excludes` looks at it (revision 8) */
+    case RBL_EV_LOST: jv_set(&o, "reason", jv_cstr(e->u.lost.text)); ev_push(s, "lost", o); break;
+    case RBL_EV_HANDSHAKE_FAILED: jv_set(&o, "reason", jv_cstr(e->u.handshake_failed.text)); ev_push(s, "handshake_failed", o); break;
     case RBL_EV_CAMERA:
         jv_set(&o, "seq", jv_num(e->u.camera.header.seq, 1));
         jv_set(&o, "viewport_width", jv_num(e->u.camera.camera.viewport_width, 1));
@@ -1974,6 +2059,37 @@ static int match_ok(const JV* act, const JV* m) {
     return 1;
 }
 
+/* revision 8: none of the step's `excludes` strings may occur in text[0..n) */
+static int excludes_ok(const JV* step, const char* what, const char* text, size_t n) {
+    const JV* ex = jv_get(step, "excludes");
+    size_t i, k;
+    for (i = 0; ex && ex->t == J_ARR && i < ex->n; i++) {
+        const JV* x = &ex->v[i];
+        if (x->t != J_STR || x->len == 0) { format_error("not a string", "excludes"); continue; }
+        for (k = 0; k + x->len <= n; k++) {
+            if (memcmp(text + k, x->s, x->len) == 0) {
+                SB d;
+                memset(&d, 0, sizeof d);
+                jv_dump(x, &d);
+                failf("%s contains %s: %.300s", what, d.p, text);
+                sb_free(&d);
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+/* every string value of v, at any depth, against the step's `excludes` */
+static int excludes_ok_all(const JV* step, const char* what, const JV* v) {
+    size_t i;
+    if (v->t == J_STR) return excludes_ok(step, what, v->s, v->len);
+    if (v->t == J_ARR || v->t == J_OBJ)
+        for (i = 0; i < v->n; i++) if (!excludes_ok_all(step, what, &v->v[i])) return 0;
+    return 1;
+}
+/* how long a step may wait: its `max_ms` (revision 8), or the default */
+static uint32_t step_wait(const JV* step) { return jv_get(step, "max_ms") ? ju32k(step, "max_ms") : STEP_WAIT_MS; }
+
 /* ---- steps; each returns 0 or 1 (failf) */
 
 static int st_connect(Sess* s, const JV* step) {
@@ -1984,6 +2100,25 @@ static int st_connect(Sess* s, const JV* step) {
     if (!ok || st != 1) { rbli_sock_close(sk); return failf("cannot connect to the implementation's control port"); }
     rbli_nodelay(sk);
     if (!raw_add(s, jstr_or(step, "conn", "a"), sk)) { rbli_sock_close(sk); return failf("too many connections"); }
+    return 0;
+}
+/* revision 8: `count` connections named `prefix` followed by 0, 1, ..., opened one after the other without polling the UT;
+ * nothing is sent on them or read from them until a later step names one. A connect that does not complete fails the case. */
+static int st_connect_many(Sess* s, const JV* step) {
+    uint32_t i, count = ju32k(step, "count");
+    const char* prefix = jstr(step, "prefix");
+    for (i = 0; i < count; i++) {
+        rbli_sock sk = rbli_tcp_connect_start(rbl_link_control_port(s->ut));
+        uint64_t end = rbli_mono_ms() + STEP_WAIT_MS;
+        char name[24];
+        int st = 0;
+        if (sk == RBLI_BAD_SOCK) return failf("cannot start connection %u", i);
+        while ((st = rbli_tcp_connect_check(sk)) == 0 && rbli_mono_ms() < end) rbli_sleep_ms(1);
+        if (st != 1) { rbli_sock_close(sk); return failf("connection %u did not complete", i); }
+        rbli_nodelay(sk);
+        snprintf(name, sizeof name, "%s%u", prefix, i);
+        if (!raw_add(s, name, sk)) { rbli_sock_close(sk); return failf("too many connections"); }
+    }
     return 0;
 }
 static int st_accept(Sess* s, const JV* step) {
@@ -2043,8 +2178,9 @@ static int st_expect_line(Sess* s, const JV* step) {
     const JV* cap;
     memset(&line, 0, sizeof line);
     if (!r) return failf("no such connection");
-    WAIT_FOR(s, STEP_WAIT_MS, (raw_fill(r), raw_take_line(r, &line)), ok);
+    WAIT_FOR(s, step_wait(step), (raw_fill(r), raw_take_line(r, &line)), ok);
     if (!ok) { sb_free(&line); return failf("no line from the implementation%s", r->eof ? " (the connection is closed)" : ""); }
+    if (!excludes_ok(step, "the line", line.p, line.n)) { sb_free(&line); return 1; } /* the raw text, before any decoding */
     perr = json_parse(line.p, line.n, &v);
     if (perr) { ret = failf("not JSON (%s): %.200s", perr, line.p); sb_free(&line); return ret; }
     if (v.t != J_OBJ) ret = failf("not a JSON object: %.200s", line.p);
@@ -2064,9 +2200,13 @@ static int st_expect_line(Sess* s, const JV* step) {
             char num[32];
             if (!val || val->t != J_NUM || !val->is_int) { ret = failf("the captured value \"%s\" is not an integer", cap->v[i].s); break; }
             snprintf(num, sizeof num, "%llu", (unsigned long long)val->num);
-            if (strcmp(cap->k[i], "ut_udp_port") == 0 && (unsigned long long)val->num != (unsigned long long)s->ut_udp)
-                ret = failf("hello announces udp_port %s, the socket is %u", num, (unsigned)s->ut_udp);
-            else var_set(s, cap->k[i], num);
+            /* revision 8: a side's UDP port is its port for one session (contract section 2); the capture is not compared
+             * with the UT's socket, it replaces the port the steps that follow send to and expect datagrams from */
+            if (strcmp(cap->k[i], "ut_udp_port") == 0) {
+                if (val->num < 1 || val->num > 65535) { ret = failf("the captured udp_port %s is not a port", num); break; }
+                s->ut_udp = (uint16_t)val->num;
+            }
+            var_set(s, cap->k[i], num);
         }
     }
     jv_free(&v);
@@ -2295,7 +2435,7 @@ static int st_expect_event(Sess* s, const JV* step) {
     const JV* m = jv_get(step, "match");
     size_t i = 0;
     int ok;
-    WAIT_FOR(s, STEP_WAIT_MS, count_events(s, ty) >= count, ok);
+    WAIT_FOR(s, step_wait(step), count_events(s, ty) >= count, ok);
     if (!ok) {
         SB q;
         int rc;
@@ -2312,6 +2452,11 @@ static int st_expect_event(Sess* s, const JV* step) {
             memmove(&s->ev[i], &s->ev[i + 1], (s->nev - i - 1) * sizeof(Ev));
             s->nev--;
             good = m ? match_ok(&e.obj, m) : 1;
+            if (good) {
+                char what[80];
+                snprintf(what, sizeof what, "%s event %u", ty, taken);
+                if (!excludes_ok_all(step, what, &e.obj)) { ev_free(&e); return 1; }
+            }
             ev_free(&e);
             if (!good) { char pre[80]; snprintf(pre, sizeof pre, "%s event %u", ty, taken); return failw(pre); }
             taken++;
@@ -2343,6 +2488,8 @@ static int run_step(Sess* s, const JV* step) {
     const char* op = jstr(step, "op");
     if (strcmp(op, "connect") == 0) return st_connect(s, step);
     if (strcmp(op, "accept") == 0) return st_accept(s, step);
+    if (strcmp(op, "connect_many") == 0) return st_connect_many(s, step);
+    if (strcmp(op, "pause") == 0) { rbli_sleep_ms(ju32k(step, "ms")); return 0; } /* revision 8: the UT is not polled at all */
     if (strcmp(op, "send_line") == 0 || strcmp(op, "send_hex") == 0 || strcmp(op, "send_fill") == 0 || strcmp(op, "send_range") == 0)
         return st_send(s, step, op);
     if (strcmp(op, "expect_line") == 0) return st_expect_line(s, step);
@@ -2431,7 +2578,7 @@ static void test_sessions(const JV* cases, const JV* dgrams) {
     Report r;
     size_t i;
     memset(&r, 0, sizeof r);
-    for (i = 0; i < cases->n; i++) record(&r, &cases->v[i], check_session(&cases->v[i], dgrams));
+    for (i = 0; i < cases->n; i++) record(&r, &cases->v[i], not_here(&cases->v[i]) ? 2 : check_session(&cases->v[i], dgrams));
     finish(&r, "sessions.json");
 }
 
@@ -2439,24 +2586,6 @@ static void test_sessions(const JV* cases, const JV* dgrams) {
 
 /* the TOKEN of the vectors; the reader's errors must not contain it */
 #define VECTOR_TOKEN "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-
-static const char* platform_name(void) {
-#if RBLI_WINDOWS
-    return "windows";
-#elif defined(__APPLE__)
-    return "macos";
-#else
-    return "linux";
-#endif
-}
-
-static int skipped_here(const JV* c) {
-    const JV* so = jv_get(c, "skip_on");
-    size_t i;
-    for (i = 0; so && so->t == J_ARR && i < so->n; i++)
-        if (so->v[i].t == J_STR && strcmp(so->v[i].s, platform_name()) == 0) return 1;
-    return 0;
-}
 
 static int write_bytes(const char* path, const uint8_t* b, size_t n) {
     FILE* f = fopen(path, "wb");
@@ -2473,7 +2602,6 @@ static int check_endpoint(const JV* c) {
     uint16_t port = 7;
     char tok[257];
     int rc, ret = 0;
-    if (skipped_here(c)) { failf("skipped on %s", platform_name()); return 2; }
     if (temp_new(&t) != 0) return failf("cannot create a temporary directory");
     temp_path(&t, "endpoint.json", path, sizeof path);
     if (!pk) {
@@ -2532,7 +2660,7 @@ static void test_endpoints(const JV* cases) {
     Report r;
     size_t i;
     memset(&r, 0, sizeof r);
-    for (i = 0; i < cases->n; i++) record(&r, &cases->v[i], check_endpoint(&cases->v[i]));
+    for (i = 0; i < cases->n; i++) record(&r, &cases->v[i], not_here(&cases->v[i]) ? 2 : check_endpoint(&cases->v[i]));
     finish(&r, "endpoints.json");
 }
 
