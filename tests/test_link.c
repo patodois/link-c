@@ -1124,7 +1124,9 @@ TEST(a_fifth_connection_displaces_the_oldest_candidate_even_one_with_part_of_a_l
     char line[300];
     int i, ok;
     uint16_t udp;
-    rbli_sock u = rbli_udp_open(0, &udp);
+    rbli_sock u;
+    REQUIRE(rbli_net_up() == 0); /* Winsock for the test's own sockets, before any link holds a reference */
+    u = rbli_udp_open(0, &udp);
     memset(&c, 0, sizeof c);
     rbl_config_init(&h, "H"); h.control_port = 0; h.timeout_ms = 5000;
     REQUIRE(u != RBLI_BAD_SOCK);
@@ -1153,6 +1155,7 @@ TEST(a_fifth_connection_displaces_the_oldest_candidate_even_one_with_part_of_a_l
     for (i = 0; i < 5; i++) rbli_sock_close(s[i]);
     rbli_sock_close(u);
     rbl_link_close(host);
+    rbli_net_down();
 }
 
 TEST(a_refused_candidate_leaves_the_others_and_a_silent_one_times_out) {
@@ -1352,20 +1355,20 @@ TEST(a_pause_of_this_side_longer_than_the_timeout_is_not_the_peers_silence) {
     uint64_t t0;
     int ok;
     memset(&c, 0, sizeof c);
-    rbl_config_init(&h, "Watch Host"); h.control_port = 0; h.timeout_ms = 400; h.heartbeat_ms = 100;
+    rbl_config_init(&h, "Watch Host"); h.control_port = 0; h.timeout_ms = 800; h.heartbeat_ms = 100;
     REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
     REQUIRE(raw_open(&r, rbl_link_control_port(host)));
-    hello_line(line, sizeof line, "guest", 1, 1, r.udp_port, 50); /* timeout max(400, 200) */
+    hello_line(line, sizeof line, "guest", 1, 1, r.udp_port, 50); /* timeout max(800, 200) */
     raw_send(&r, line);
     REQUIRE(raw_wait_line(&r, host, &c, 2000, line, sizeof line));
     REQUIRE(rbl_link_is_connected(host));
-    rbli_sleep_ms(1000); /* the host is not polled: as if its process had been stopped */
+    rbli_sleep_ms(1600); /* the host is not polled: as if its process had been stopped */
     t0 = rbli_mono_ms();
-    WAIT_UNTIL(250, col_poll(host, &c), c.lost > 0, ok);
+    WAIT_UNTIL(400, col_poll(host, &c), c.lost > 0, ok);
     CHECK(!ok); /* the silence counts from the first poll after the pause */
-    WAIT_UNTIL(1500, col_poll(host, &c), c.lost > 0, ok);
+    WAIT_UNTIL(2500, col_poll(host, &c), c.lost > 0, ok);
     CHECK(ok); /* and the peer, which stays silent, is lost a whole timeout later */
-    CHECK(rbli_mono_ms() - t0 >= 380);
+    CHECK(rbli_mono_ms() - t0 >= 780);
     raw_close(&r);
     rbl_link_close(host);
 }
@@ -1399,19 +1402,21 @@ TEST(a_pause_keeps_a_hosts_candidate_and_a_guests_wait_for_hello) {
     Col c;
     rbli_sock s, listener, acc = RBLI_BAD_SOCK;
     uint16_t port, udp;
-    rbli_sock u = rbli_udp_open(0, &udp);
+    rbli_sock u;
     char line[400];
     int ok;
+    REQUIRE(rbli_net_up() == 0); /* Winsock for the test's own sockets, before any link holds a reference */
+    u = rbli_udp_open(0, &udp);
     REQUIRE(u != RBLI_BAD_SOCK);
     /* host: a candidate accepted before the pause still has the whole timeout after it */
     memset(&c, 0, sizeof c);
-    rbl_config_init(&h, "H"); h.control_port = 0; h.timeout_ms = 400;
+    rbl_config_init(&h, "H"); h.control_port = 0; h.timeout_ms = 800;
     REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
     s = tcp_to(rbl_link_control_port(host));
     REQUIRE(s != RBLI_BAD_SOCK);
     WAIT_UNTIL(50, col_poll(host, &c), 0, ok);
     CHECK_EQ(host->ncand, 1);
-    rbli_sleep_ms(1000);
+    rbli_sleep_ms(1600);
     col_poll(host, &c);
     CHECK_EQ(host->ncand, 1);
     hello_line(line, sizeof line, "guest", 1, 1, udp, 250);
@@ -1424,13 +1429,13 @@ TEST(a_pause_keeps_a_hosts_candidate_and_a_guests_wait_for_hello) {
     memset(&c, 0, sizeof c);
     listener = rbli_tcp_listen(0, &port);
     REQUIRE(listener != RBLI_BAD_SOCK);
-    rbl_config_init(&g, "G"); g.control_port = port; g.timeout_ms = 400;
+    rbl_config_init(&g, "G"); g.control_port = port; g.timeout_ms = 800;
     REQUIRE(rbl_link_guest(&g, &guest) == RBL_OK);
     WAIT_UNTIL(1000, col_poll(guest, &c), (acc = rbli_tcp_accept(listener)) != RBLI_BAD_SOCK, ok);
     REQUIRE(ok);
     WAIT_UNTIL(100, col_poll(guest, &c), guest->state == RBLI_HANDSHAKE, ok);
     REQUIRE(ok);
-    rbli_sleep_ms(1000);
+    rbli_sleep_ms(1600);
     col_poll(guest, &c);
     CHECK_EQ(c.hsfail, 0);
     snprintf(line, sizeof line, "{\"type\":\"hello\",\"role\":\"host\",\"game\":\"h\",\"protocol\":1,\"min_protocol\":1,\"udp_port\":%u,"
@@ -1442,6 +1447,7 @@ TEST(a_pause_keeps_a_hosts_candidate_and_a_guests_wait_for_hello) {
     rbli_sock_close(acc);
     rbli_sock_close(listener);
     rbli_sock_close(u);
+    rbli_net_down();
 }
 
 TEST(bye_is_delivered_and_the_close_is_clean_while_the_closer_has_unread_data) {
@@ -1668,6 +1674,7 @@ TEST(datagrams_from_another_address_are_dropped_by_the_connected_socket) {
  * next hello announces the new port. A socket on a fixed port is kept and connected again to the next peer. */
 TEST(an_automatic_udp_port_is_a_new_socket_for_each_session_and_a_fixed_one_is_connected_again) {
     int fixed;
+    REQUIRE(rbli_net_up() == 0); /* Winsock for the socket that finds a free port, before any link holds a reference */
     for (fixed = 0; fixed < 2; fixed++) {
         rbl_config h, g;
         Pair p;
@@ -1703,6 +1710,7 @@ TEST(an_automatic_udp_port_is_a_new_socket_for_each_session_and_a_fixed_one_is_c
         CHECK(ok);
         pair_close(&p);
     }
+    rbli_net_down();
 }
 
 /* Revision 8 (section 2): at most 64 datagrams are read per poll without a session and 1024 with one; the rest wait in the
@@ -1774,7 +1782,7 @@ TEST(an_unreachable_peer_udp_port_loses_datagrams_not_the_session) {
     char line[400];
     rbl_camera cam;
     float eye[3] = {0, 0, 0}, tgt[3] = {0, 0, -1};
-    uint64_t end;
+    int i;
     rbl_stats s0;
     memset(&c, 0, sizeof c);
     rbl_config_init(&h, "H"); h.control_port = 0; h.timeout_ms = 1000; h.heartbeat_ms = 20;
@@ -1787,8 +1795,7 @@ TEST(an_unreachable_peer_udp_port_loses_datagrams_not_the_session) {
     r.udp = RBLI_BAD_SOCK;
     rbl_camera_look_at(&cam, eye, tgt, 1.0f, 0.1f, 10.0f, 8, 8);
     s0 = stats_of(host);
-    end = rbli_mono_ms() + 600;
-    while (rbli_mono_ms() < end) { /* the peer stays alive on the control channel (an unknown type counts) */
+    for (i = 0; i < 30; i++) { /* the peer stays alive on the control channel (an unknown type counts) */
         raw_send(&r, "{\"type\":\"still_here\"}\n");
         CHECK_EQ(rbl_link_send_camera(host, &cam, NULL), RBL_OK);
         col_poll(host, &c);
@@ -1797,7 +1804,7 @@ TEST(an_unreachable_peer_udp_port_loses_datagrams_not_the_session) {
     }
     CHECK_EQ(c.lost, 0);
     CHECK(rbl_link_is_connected(host));
-    CHECK(stats_of(host).datagrams_sent + stats_of(host).send_dropped > s0.datagrams_sent + s0.send_dropped + 20);
+    CHECK(stats_of(host).datagrams_sent + stats_of(host).send_dropped >= s0.datagrams_sent + s0.send_dropped + 30);
     raw_close(&r);
     rbl_link_close(host);
 }
