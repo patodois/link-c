@@ -1022,7 +1022,8 @@ static rbli_sock rbli_tcp_listen(uint16_t port, uint16_t* bound) {
     { int one = 1; setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (const char*)&one, sizeof one); }
 #endif
     rbli_loopback(&a, port);
-    if (bind(s, (struct sockaddr*)&a, sizeof a) != 0 || listen(s, 8) != 0 || rbli_sock_nonblock(s) != 0 ||
+    /* a backlog of 128: connections beyond the 8 a poll accepts wait there for the next poll (revision 8, section 2) */
+    if (bind(s, (struct sockaddr*)&a, sizeof a) != 0 || listen(s, 128) != 0 || rbli_sock_nonblock(s) != 0 ||
         rbli_local_port(s, bound) != 0) {
         rbli_sock_close(s);
         return RBLI_BAD_SOCK;
@@ -2100,7 +2101,11 @@ RBLDEF int rbl_token_equal(const void* a, size_t alen, const void* b, size_t ble
  * The link: control channel, closing connections, the arena, the entity table
  * ---------------------------------------------------------------------------------------- */
 
-#define RBLI_MAX_CLOSING 8
+/* Revision 8 (sections 2 and 6.1): the bounds on what connections that have shown no token can cost a host per poll, at the
+ * contract's reference values. */
+#define RBLI_MAX_CLOSING 16   /* closing sockets; one more closes the oldest at once, without the rest of its drain */
+#define RBLI_MAX_CANDIDATES 4 /* connections that have not delivered a complete first line, while no session is live */
+#define RBLI_MAX_ACCEPTS 8    /* connections accepted per poll; the others wait in the listen backlog */
 #define RBLI_ENT_CAP 2048 /* a power of two, twice RBL_MAX_ENTITIES */
 #define RBLI_BLK_HDR 32
 #define RBLI_BLK_SIZE 65536
@@ -2134,6 +2139,9 @@ typedef struct rbli_closing {
     int shut;
 } rbli_closing;
 
+/* Host, revision 8 (section 2): a connection that has not yet delivered a complete first line, and when it was accepted. */
+typedef struct rbli_cand { rbli_ctl ctl; uint64_t since; } rbli_cand;
+
 typedef struct rbli_chunk { rbl_triangle* t; uint32_t n; uint32_t got; } rbli_chunk;
 
 typedef struct rbli_ent { uint64_t time_us; uint32_t id; uint32_t used; } rbli_ent;
@@ -2157,11 +2165,13 @@ struct rbl_link {
     uint16_t udp_port, control_port;
     int net_up;
 
-    rbli_state state;
+    rbli_state state;    /* a host is IDLE (with its candidates) or LIVE; a guest goes IDLE, CONNECTING, HANDSHAKE, LIVE */
     uint64_t next_try;   /* IDLE: a guest connects again at this time */
     uint64_t since;      /* CONNECTING, HANDSHAKE: when it began */
     rbli_sock connecting;
     rbli_ctl ctl;        /* HANDSHAKE, LIVE */
+    rbli_cand cand[RBLI_MAX_CANDIDATES]; /* host: the candidates, oldest first */
+    int ncand;
     rbl_peer_info peer;  /* LIVE */
     uint64_t timeout_ms, last_heard, last_beat;
 
@@ -2648,19 +2658,11 @@ static void rbli_abort_connect(rbl_link* l, uint64_t now) {
     l->next_try = now + l->cfg.reconnect_ms;
 }
 
+static void rbli_poll_candidates(rbl_link* l, uint64_t now);
+
 static void rbli_poll_connect(rbl_link* l, uint64_t now) {
     if (l->listener != RBLI_BAD_SOCK) {
-        for (;;) {
-            rbli_sock s = rbli_tcp_accept(l->listener);
-            if (s == RBLI_BAD_SOCK) break;
-            if (l->state == RBLI_IDLE) {
-                rbli_ctl_init(&l->ctl, s);
-                l->state = RBLI_HANDSHAKE;
-                l->since = now;
-            } else {
-                rbli_retire(l, s, NULL, 0, 0, "busy", now); /* one guest per host */
-            }
-        }
+        rbli_poll_candidates(l, now);
         return;
     }
     if (l->state == RBLI_IDLE && now >= l->next_try) {
@@ -2707,6 +2709,9 @@ static void rbli_poll_connect(rbl_link* l, uint64_t now) {
 
 /* ---- polling: control lines ---- */
 
+/* The checks of contract section 6 on the peer's hello, the token first (section 6.2). On success the session is live on
+ * l->ctl (a host queues its reply there), CONNECTED is reported and the first heartbeat sent; otherwise reason holds a fixed
+ * text and 1 is returned. */
 static int rbli_on_hello(rbl_link* l, const rbl_control* c, uint64_t now, char* reason, size_t rcap) {
     const rbl_str* g = &c->u.hello.game;
     rbl_role expected = l->role == RBL_ROLE_HOST ? RBL_ROLE_GUEST : RBL_ROLE_HOST;
@@ -2886,6 +2891,112 @@ static int rbli_on_line(rbl_link* l, char* line, size_t len, uint64_t now, char*
     }
     default:
         return 0; /* an unknown type is ignored; bye was handled above */
+    }
+}
+
+/* ---- polling: a host's candidates (revision 8, contract section 2) ---- */
+
+/* Takes candidate i out of the list (the others move up) and returns its connection. */
+static rbli_ctl rbli_cand_take(rbl_link* l, int i) {
+    rbli_ctl c = l->cand[i].ctl;
+    memmove(&l->cand[i], &l->cand[i + 1], sizeof(rbli_cand) * (size_t)(l->ncand - i - 1));
+    l->ncand--;
+    return c;
+}
+
+/* Closes a connection that is not the session's (6.1), with a bye if `bye` is not NULL. */
+static void rbli_retire_other(rbl_link* l, rbli_ctl* c, const char* bye, uint64_t now) {
+    char* wbuf = c->wbuf;
+    size_t wlen = c->wlen, wcap = c->wcap;
+    if (c->werr) { bye = NULL; wlen = 0; }
+    if (c->rbuf) REWRITE_LINK_FREE(c->rbuf);
+    rbli_retire(l, c->sock, wbuf, wlen, wcap, bye, now);
+    memset(c, 0, sizeof *c);
+    c->sock = RBLI_BAD_SOCK;
+}
+
+/* A candidate whose first line was refused (or that failed or timed out): it is answered as section 6 says (a bye with the
+ * fixed reason when `bye` is set) and closed, and the application hears of a failed handshake. The others are not affected. */
+static void rbli_cand_refuse(rbl_link* l, int i, const char* reason, int bye, uint64_t now) {
+    rbli_ctl c = rbli_cand_take(l, i);
+    char text[200];
+    rbli_copy_text(text, sizeof text, reason, strlen(reason));
+    rbli_retire_other(l, &c, bye ? text : NULL, now);
+    rbli_report_end(l, 0, text);
+}
+
+/* Reads candidate i and acts on its first line, if a complete one has arrived. Returns 1 if it is still a candidate. A first
+ * line that is an acceptable hello makes it the session, and every other candidate is answered busy; any other first line is
+ * refused, and the other candidates are not affected. What follows the hello in its buffer is read by rbli_poll_control. */
+static int rbli_cand_read(rbl_link* l, int i, uint64_t now) {
+    rbli_ctl* c = &l->cand[i].ctl;
+    rbl_control m;
+    const char* why = "bad control line";
+    char reason[200];
+    char* line;
+    size_t len;
+    int r;
+    rbli_ctl_fill(c);
+    r = rbli_ctl_next_line(c, &line, &len);
+    if (r < 0) { rbli_cand_refuse(l, i, c->fatal, 1, now); return 0; }
+    if (r == 0) {
+        if (c->end) { rbli_cand_refuse(l, i, c->end, 0, now); return 0; }
+        return 1; /* nothing complete yet: still a candidate, also with part of a line */
+    }
+    l->stats.lines_received++;
+    if (rbl_control_parse(line, len, &m, &why) != RBL_OK) {
+        snprintf(reason, sizeof reason, "protocol error: %s", why);
+        rbli_cand_refuse(l, i, reason, 1, now);
+        return 0;
+    }
+    if (m.type == RBL_CTL_BYE) {
+        char t[160];
+        rbli_copy_text(t, sizeof t, m.u.bye.reason.ptr, m.u.bye.reason.len);
+        snprintf(reason, sizeof reason, "peer said bye: %s", t);
+        rbli_cand_refuse(l, i, reason, 0, now);
+        return 0;
+    }
+    if (m.type != RBL_CTL_HELLO) { rbli_cand_refuse(l, i, "expected hello", 1, now); return 0; }
+    /* the session's connection from here on, if the hello passes: the reply is queued on it */
+    l->ctl = rbli_cand_take(l, i);
+    if (rbli_on_hello(l, &m, now, reason, sizeof reason) != 0) {
+        rbli_ctl c2 = l->ctl;
+        rbli_ctl_init(&l->ctl, RBLI_BAD_SOCK);
+        rbli_retire_other(l, &c2, reason, now);
+        rbli_report_end(l, 0, reason);
+        return 0;
+    }
+    while (l->ncand > 0) { /* the session is live: every other candidate is told busy, without its lines being read */
+        rbli_ctl o = rbli_cand_take(l, 0);
+        rbli_retire_other(l, &o, "busy", now);
+    }
+    return 0;
+}
+
+/* Host: reads the candidates it holds, oldest first, then accepts at most RBLI_MAX_ACCEPTS connections and reads each one at
+ * once, before the next. A connection that finds a session live is answered busy without being read; one that finds four
+ * candidates held closes the oldest, with a bye of its own reason, to make room. Nothing is read or accepted while the event
+ * array has no room for the event a candidate can give; the rest waits for the next poll. */
+static void rbli_poll_candidates(rbl_link* l, uint64_t now) {
+    int i = 0, k;
+    while (i < l->ncand) {
+        if (!rbli_room(l)) return;
+        if (rbli_cand_read(l, i, now)) i++;
+    }
+    for (k = 0; k < RBLI_MAX_ACCEPTS; k++) {
+        rbli_sock s;
+        if (l->state != RBLI_LIVE && !rbli_room(l)) return;
+        s = rbli_tcp_accept(l->listener);
+        if (s == RBLI_BAD_SOCK) return;
+        if (l->state == RBLI_LIVE) { rbli_retire(l, s, NULL, 0, 0, "busy", now); continue; } /* one guest per host */
+        if (l->ncand == RBLI_MAX_CANDIDATES) {
+            rbli_ctl oldest = rbli_cand_take(l, 0);
+            rbli_retire_other(l, &oldest, "no first line before newer connections arrived", now); /* not busy: no session */
+        }
+        rbli_ctl_init(&l->cand[l->ncand].ctl, s);
+        l->cand[l->ncand].since = now;
+        l->ncand++;
+        rbli_cand_read(l, l->ncand - 1, now);
     }
 }
 
@@ -3107,6 +3218,11 @@ static void rbli_pump_collision(rbl_link* l) {
 }
 
 static void rbli_poll_timers(rbl_link* l, uint64_t now) {
+    int i = 0;
+    while (i < l->ncand) { /* a candidate that nothing displaced has the host's own timeout_ms for its first line */
+        if (now - l->cand[i].since > l->cfg.timeout_ms && rbli_room(l)) rbli_cand_refuse(l, i, "no hello before the timeout", 1, now);
+        else i++;
+    }
     if (l->state == RBLI_HANDSHAKE && now - l->since > l->cfg.timeout_ms) {
         rbli_end(l, "no hello before the timeout", 1);
     } else if (l->state == RBLI_LIVE) {
@@ -3162,6 +3278,11 @@ static void rbli_link_destroy(rbl_link* l) {
     if (l->connecting != RBLI_BAD_SOCK) rbli_sock_close(l->connecting);
     if (l->ctl.sock != RBLI_BAD_SOCK) rbli_sock_close(l->ctl.sock);
     rbli_ctl_free(&l->ctl);
+    for (i = 0; i < l->ncand; i++) {
+        if (l->cand[i].ctl.sock != RBLI_BAD_SOCK) rbli_sock_close(l->cand[i].ctl.sock);
+        rbli_ctl_free(&l->cand[i].ctl);
+    }
+    l->ncand = 0;
     for (i = 0; i < l->nclosing; i++) rbli_closing_free(&l->closing[i]);
     l->nclosing = 0;
     rbli_cq_clear(l);
@@ -3472,6 +3593,10 @@ RBLDEF void rbl_link_close(rbl_link* l) {
         l->connecting = RBLI_BAD_SOCK;
     }
     if (l->state == RBLI_HANDSHAKE || l->state == RBLI_LIVE) rbli_retire_ctl(l, "closing", now);
+    while (l->ncand > 0) {
+        rbli_ctl c = rbli_cand_take(l, 0);
+        rbli_retire_other(l, &c, "closing", now);
+    }
     l->state = RBLI_IDLE;
     stop = now + RBL_LINGER_MS + 50;
     while (l->nclosing > 0 && rbli_mono_ms() < stop) {

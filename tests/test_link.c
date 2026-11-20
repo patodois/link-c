@@ -1053,6 +1053,201 @@ TEST(second_connection_gets_bye_busy) {
     pair_close(&p);
 }
 
+/* ---- revision 8: candidates and the bounds per poll (contract sections 2 and 6.1) ---- */
+
+/* A TCP connection to the host's control port, completed without polling the host (the system's backlog takes it). */
+static rbli_sock tcp_to(uint16_t port) {
+    rbli_sock s = rbli_tcp_connect_start(port);
+    uint64_t end = rbli_mono_ms() + 2000;
+    int st = 0;
+    if (s == RBLI_BAD_SOCK) return s;
+    while ((st = rbli_tcp_connect_check(s)) == 0 && rbli_mono_ms() < end) rbli_sleep_ms(1);
+    if (st != 1) { rbli_sock_close(s); return RBLI_BAD_SOCK; }
+    return s;
+}
+/* The next line on s within ms (polling host), without its newline; 1 if one came. */
+static int sock_line(rbli_sock s, rbl_link* host, Col* c, int ms, char* out, size_t cap) {
+    size_t n = 0;
+    uint64_t end = rbli_mono_ms() + (uint64_t)ms;
+    while (rbli_mono_ms() < end) {
+        char ch;
+        int k;
+        if (host) col_poll(host, c);
+        while ((k = rbli_tcp_recv(s, &ch, 1)) == 1) {
+            if (ch == '\n') { out[n] = 0; return 1; }
+            if (n + 1 < cap) out[n++] = ch;
+        }
+        if (k == 0 || k == -2) return 0;
+        rbli_sleep_ms(2);
+    }
+    return 0;
+}
+
+TEST(a_silent_connection_does_not_keep_the_guest_with_the_token_out) {
+    rbl_config h, g;
+    Pair p;
+    rbli_sock silent;
+    char line[200];
+    int ok;
+    memset(&p, 0, sizeof p);
+    rbl_config_init(&h, "H"); h.control_port = 0; h.token = "the-token";
+    rbl_config_init(&g, "G"); g.token = "the-token"; g.reconnect_ms = 50;
+    REQUIRE(rbl_link_host(&h, &p.host) == RBL_OK);
+    silent = tcp_to(rbl_link_control_port(p.host));
+    REQUIRE(silent != RBLI_BAD_SOCK);
+    WAIT_UNTIL(100, col_poll(p.host, &p.hc), 0, ok); /* the host has accepted it: it holds a candidate that sends nothing */
+    g.control_port = rbl_link_control_port(p.host);
+    REQUIRE(rbl_link_guest(&g, &p.guest) == RBL_OK);
+    WAIT_UNTIL(1000, pair_pump(&p), rbl_link_is_connected(p.host) && rbl_link_is_connected(p.guest), ok);
+    CHECK(ok);
+    CHECK_EQ(p.gc.hsfail, 0); /* the guest was never answered busy */
+    CHECK(sock_line(silent, p.host, &p.hc, 1000, line, sizeof line));
+    CHECK_STR(line, "{\"type\":\"bye\",\"reason\":\"busy\"}"); /* told busy once the session is live */
+    rbli_sock_close(silent);
+    pair_close(&p);
+}
+
+TEST(a_fifth_connection_displaces_the_oldest_candidate_even_one_with_part_of_a_line) {
+    rbl_config h;
+    rbl_link* host;
+    Col c;
+    rbli_sock s[5];
+    char line[300];
+    int i, ok;
+    uint16_t udp;
+    rbli_sock u = rbli_udp_open(0, &udp);
+    memset(&c, 0, sizeof c);
+    rbl_config_init(&h, "H"); h.control_port = 0; h.timeout_ms = 5000;
+    REQUIRE(u != RBLI_BAD_SOCK);
+    REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
+    for (i = 0; i < 5; i++) { /* one per poll, the first with part of a hello */
+        s[i] = tcp_to(rbl_link_control_port(host));
+        REQUIRE(s[i] != RBLI_BAD_SOCK);
+        if (i == 0) CHECK_EQ(rbli_tcp_send(s[0], "{\"type\":\"hello\",\"ro", 20), 20);
+        WAIT_UNTIL(30, col_poll(host, &c), 0, ok);
+    }
+    CHECK_EQ(host->ncand, 4);
+    REQUIRE(sock_line(s[0], host, &c, 1000, line, sizeof line)); /* the oldest is closed with a bye of its own reason */
+    CHECK(strstr(line, "\"type\":\"bye\"") != NULL && strstr(line, "busy") == NULL);
+    CHECK(!sock_line(s[1], host, &c, 100, line, sizeof line)); /* the second oldest is still a candidate */
+    hello_line(line, sizeof line, "guest", 1, 1, udp, 250);
+    CHECK_EQ(rbli_tcp_send(s[1], line, strlen(line)), (int)strlen(line));
+    REQUIRE(sock_line(s[1], host, &c, 1000, line, sizeof line));
+    CHECK(strstr(line, "\"type\":\"hello\"") != NULL);
+    CHECK(rbl_link_is_connected(host));
+    for (i = 2; i < 5; i++) { /* the others are told busy */
+        CHECK(sock_line(s[i], host, &c, 1000, line, sizeof line));
+        CHECK_STR(line, "{\"type\":\"bye\",\"reason\":\"busy\"}");
+    }
+    CHECK_EQ(host->ncand, 0);
+    CHECK_EQ(c.hsfail, 0); /* neither the displaced nor the busy ones are failed handshakes */
+    for (i = 0; i < 5; i++) rbli_sock_close(s[i]);
+    rbli_sock_close(u);
+    rbl_link_close(host);
+}
+
+TEST(a_refused_candidate_leaves_the_others_and_a_silent_one_times_out) {
+    rbl_config h;
+    rbl_link* host;
+    Col c;
+    rbli_sock a, b;
+    char line[300];
+    int ok;
+    memset(&c, 0, sizeof c);
+    rbl_config_init(&h, "H"); h.control_port = 0; h.timeout_ms = 400;
+    REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
+    a = tcp_to(rbl_link_control_port(host));
+    b = tcp_to(rbl_link_control_port(host));
+    REQUIRE(a != RBLI_BAD_SOCK && b != RBLI_BAD_SOCK);
+    WAIT_UNTIL(50, col_poll(host, &c), 0, ok);
+    CHECK_EQ(host->ncand, 2);
+    CHECK_EQ(rbli_tcp_send(b, "garbage\n", 8), 8);
+    REQUIRE(sock_line(b, host, &c, 1000, line, sizeof line));
+    CHECK(strstr(line, "protocol error") != NULL);
+    CHECK_EQ(c.hsfail, 1);
+    CHECK_EQ(host->ncand, 1);
+    REQUIRE(sock_line(a, host, &c, 1500, line, sizeof line)); /* a's own timeout */
+    CHECK(strstr(line, "no hello before the timeout") != NULL);
+    CHECK_EQ(c.hsfail, 2);
+    CHECK_EQ(host->ncand, 0);
+    rbli_sock_close(a);
+    rbli_sock_close(b);
+    rbl_link_close(host);
+}
+
+/* A live host and n connections in its backlog that never read; returns the host (and the raw guest in r). */
+static rbl_link* live_host_with_backlog(Raw* r, Col* c, rbli_sock* conns, int n) {
+    rbl_config h;
+    rbl_link* host;
+    char line[300];
+    int i;
+    memset(c, 0, sizeof *c);
+    rbl_config_init(&h, "H"); h.control_port = 0; h.timeout_ms = 10000;
+    if (rbl_link_host(&h, &host) != RBL_OK) return NULL;
+    if (!raw_open(r, rbl_link_control_port(host))) return host;
+    hello_line(line, sizeof line, "guest", 1, 1, r->udp_port, 250);
+    raw_send(r, line);
+    if (!raw_wait_line(r, host, c, 2000, line, sizeof line)) return host;
+    for (i = 0; i < n; i++) conns[i] = tcp_to(rbl_link_control_port(host));
+    return host;
+}
+
+TEST(a_poll_accepts_at_most_eight_connections) {
+    static Raw r;
+    Col c;
+    rbli_sock conns[20];
+    rbl_link* host = live_host_with_backlog(&r, &c, conns, 20);
+    uint64_t sent0;
+    int i;
+    REQUIRE(host && rbl_link_is_connected(host));
+    for (i = 0; i < 20; i++) REQUIRE(conns[i] != RBLI_BAD_SOCK);
+    sent0 = stats_of(host).lines_sent;
+    col_poll(host, &c);
+    CHECK_EQ(stats_of(host).lines_sent - sent0, 8); /* eight answered busy; the others wait in the backlog */
+    col_poll(host, &c);
+    CHECK_EQ(stats_of(host).lines_sent - sent0, 16);
+    col_poll(host, &c);
+    CHECK_EQ(stats_of(host).lines_sent - sent0, 20);
+    CHECK(rbl_link_is_connected(host));
+    for (i = 0; i < 20; i++) rbli_sock_close(conns[i]);
+    raw_close(&r);
+    rbl_link_close(host);
+}
+
+TEST(a_host_holds_at_most_sixteen_closing_sockets) {
+    static Raw r;
+    Col c;
+    rbli_sock conns[30];
+    rbl_link* host = live_host_with_backlog(&r, &c, conns, 30);
+    int i, answered = 0;
+    REQUIRE(host && rbl_link_is_connected(host));
+    for (i = 0; i < 30; i++) REQUIRE(conns[i] != RBLI_BAD_SOCK);
+    for (i = 0; i < 4; i++) col_poll(host, &c); /* all 30 accepted and answered busy, well within their 200 ms drain */
+    CHECK_EQ(host->nclosing, 16);
+    for (i = 0; i < 30; i++) { /* each one got its bye, or was closed at once without the rest of its drain */
+        char line[100];
+        if (sock_line(conns[i], NULL, NULL, 300, line, sizeof line) && strstr(line, "busy")) answered++;
+    }
+    CHECK_EQ(answered, 30);
+    CHECK(rbl_link_is_connected(host));
+    for (i = 0; i < 30; i++) rbli_sock_close(conns[i]);
+    raw_close(&r);
+    rbl_link_close(host);
+}
+
+TEST(forty_connections_wait_in_the_backlog_while_the_host_is_not_polled) {
+    rbl_config h;
+    rbl_link* host;
+    rbli_sock conns[40];
+    int i, done = 0;
+    rbl_config_init(&h, "H"); h.control_port = 0;
+    REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
+    for (i = 0; i < 40; i++) { conns[i] = tcp_to(rbl_link_control_port(host)); if (conns[i] != RBLI_BAD_SOCK) done++; }
+    CHECK_EQ(done, 40);
+    for (i = 0; i < 40; i++) if (conns[i] != RBLI_BAD_SOCK) rbli_sock_close(conns[i]);
+    rbl_link_close(host);
+}
+
 TEST(hello_with_wrong_role_protocol_or_garbage_gets_bye) {
     static const struct { const char* line; const char* word; } cases[] = {
         {"{\"type\":\"hello\",\"role\":\"host\",\"game\":\"x\",\"protocol\":1,\"min_protocol\":1,\"udp_port\":5,\"heartbeat_ms\":250,\"timeout_ms\":2000}\n", "role"},
@@ -3257,6 +3452,12 @@ int main(void) {
     RUN(fuzz_control_lines_never_crash);
     RUN(handshake_state_flow_and_clean_bye);
     RUN(second_connection_gets_bye_busy);
+    RUN(a_silent_connection_does_not_keep_the_guest_with_the_token_out);
+    RUN(a_fifth_connection_displaces_the_oldest_candidate_even_one_with_part_of_a_line);
+    RUN(a_refused_candidate_leaves_the_others_and_a_silent_one_times_out);
+    RUN(a_poll_accepts_at_most_eight_connections);
+    RUN(a_host_holds_at_most_sixteen_closing_sockets);
+    RUN(forty_connections_wait_in_the_backlog_while_the_host_is_not_polled);
     RUN(hello_with_wrong_role_protocol_or_garbage_gets_bye);
     RUN(a_peers_reason_reaches_the_event_without_control_characters);
     RUN(watchdog_loses_a_silent_guest);

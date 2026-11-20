@@ -59,18 +59,10 @@
 
 /* Vectors this implementation fails: { id, why }, the list ends with { NULL, NULL }. */
 static const struct { const char* id; const char* why; } KNOWN_DISAGREEMENTS[] = {
-    { "sess.host.handshake.silent_candidate_does_not_hold_the_handshake", "revision 8 candidates and bounds (section 2): not yet implemented" },
-    { "sess.host.token.silent_candidate_does_not_hold_a_token_host", "revision 8 candidates and bounds (section 2): not yet implemented" },
-    { "sess.host.handshake.refused_candidate_leaves_the_others", "revision 8 candidates and bounds (section 2): not yet implemented" },
-    { "sess.host.handshake.fifth_connection_displaces_the_oldest", "revision 8 candidates and bounds (section 2): not yet implemented" },
-    { "sess.host.handshake.displaced_candidate_is_the_oldest", "revision 8 candidates and bounds (section 2): not yet implemented" },
-    { "sess.host.handshake.partial_line_does_not_protect_a_candidate", "revision 8 candidates and bounds (section 2): not yet implemented" },
-    { "sess.host.flood.session_survives_a_connection_flood", "revision 8 candidates and bounds (section 2): not yet implemented" },
-    { "sess.host.flood.guest_gets_in_after_a_flood", "revision 8 candidates and bounds (section 2): not yet implemented" },
     { "sess.host.watchdog.own_pause_is_not_peer_silence", "revision 8 side that was not running (section 7): not yet implemented" },
     { "sess.guest.watchdog.own_pause_is_not_peer_silence", "revision 8 side that was not running (section 7): not yet implemented" },
-    { "sess.host.handshake.own_pause_keeps_the_candidate", "revision 8 candidates and bounds (section 2): not yet implemented" },
     { "sess.guest.handshake.own_pause_keeps_the_wait_for_hello", "revision 8 side that was not running (section 7): not yet implemented" },
+    { "sess.host.handshake.own_pause_keeps_the_candidate", "revision 8 side that was not running (section 7): not yet implemented" },
     { NULL, NULL }
 };
 
