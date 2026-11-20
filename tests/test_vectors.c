@@ -59,9 +59,6 @@
 
 /* Vectors this implementation fails: { id, why }, the list ends with { NULL, NULL }. */
 static const struct { const char* id; const char* why; } KNOWN_DISAGREEMENTS[] = {
-    { "ctl.json.number_rounds_to_largest_double_17_digits", "revision 8 numbers (section 8, point 9): not yet implemented" },
-    { "ctl.json.number_rounds_to_largest_double_19_digits", "revision 8 numbers (section 8, point 9): not yet implemented" },
-    { "ctl.json.number_one_below_halfway_integer", "revision 8 numbers (section 8, point 9): not yet implemented" },
     { "sess.host.handshake.silent_candidate_does_not_hold_the_handshake", "revision 8 candidates and bounds (section 2): not yet implemented" },
     { "sess.host.token.silent_candidate_does_not_hold_a_token_host", "revision 8 candidates and bounds (section 2): not yet implemented" },
     { "sess.host.handshake.refused_candidate_leaves_the_others", "revision 8 candidates and bounds (section 2): not yet implemented" },

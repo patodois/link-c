@@ -1557,45 +1557,49 @@ static int rbli_jnumber(rbli_jp* p, rbli_jf* cap) {
         }
         if (exp_neg) exp10 = -exp10;
     }
-    {   /* a number beyond the range of a double is an error (it would be infinity) */
-        size_t k, lead_zero = 0, sig_int;
-        long dexp;
-        int have_sig = 0;
-        char first[17];
-        size_t nfirst = 0;
-        /* significant digits: integer part without leading zeros, then the fraction */
-        sig_int = 0;
-        for (k = int_start; k < int_end; k++) {
-            if (!have_sig && p->s[k] == '0') continue;
-            have_sig = 1;
-            if (nfirst < 17) first[nfirst++] = p->s[k];
-            sig_int++;
+    {   /* revision 8 (section 8, point 9): a literal whose correctly rounded double is not finite is an error, wherever it
+         * stands. The boundary is 2^1024 - 2^970, halfway between the largest double and 2^1024: below it the literal rounds
+         * to a finite double, at it or above it (ties to even) to infinity. The literal's significant digits are compared
+         * with the boundary's 309 digits; nothing is converted. */
+        static const char half[] =
+            "179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692"
+            "887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842"
+            "914819860834936475292719074168444365510704342711559699508093042880177904174497792";
+        size_t k, first = 0, lead_zero = 0, sig_int = 0;
+        long dexp = 0;
+        int have_sig = 0, in_int = 1;
+        for (k = int_start; k < int_end; k++) { /* the first significant digit, in the integer part or in the fraction */
+            if (p->s[k] != '0') { have_sig = 1; first = k; sig_int = int_end - k; break; }
         }
         if (have_sig) {
-            for (k = frac_start; k < frac_end && nfirst < 17; k++) first[nfirst++] = p->s[k];
             dexp = (long)sig_int - 1 + exp10;
         } else {
             for (k = frac_start; k < frac_end; k++) {
-                if (p->s[k] == '0') { lead_zero++; continue; }
-                have_sig = 1;
-                break;
+                if (p->s[k] != '0') { have_sig = 1; first = k; in_int = 0; break; }
+                lead_zero++;
             }
-            if (have_sig) {
-                for (; k < frac_end && nfirst < 17; k++) first[nfirst++] = p->s[k];
-                dexp = -(long)(lead_zero + 1) + exp10;
-            } else {
-                dexp = -100000;
-            }
+            if (have_sig) dexp = -(long)(lead_zero + 1) + exp10;
         }
-        if (have_sig) {
-            if (dexp > 308) return rbli_jfail(p, "number out of range");
-            if (dexp == 308) {
-                static const char max17[] = "17976931348623158";
-                char pad[17];
-                size_t m;
-                for (m = 0; m < 17; m++) pad[m] = m < nfirst ? first[m] : '0';
-                if (memcmp(pad, max17, 17) >= 0) return rbli_jfail(p, "number out of range");
+        if (have_sig && dexp > 308) return rbli_jfail(p, "number out of range");
+        if (have_sig && dexp == 308) {
+            /* the significant digits in order (integer part from `first`, then the fraction), against the boundary's,
+             * either side padded with zeros: the first difference decides, and equal is out of range */
+            size_t at = first, h = 0;
+            int cmp = 0;
+            for (;;) {
+                int d, b;
+                if (in_int && at >= int_end) { in_int = 0; at = frac_start; }
+                d = (!in_int && at >= frac_end) ? -1 : p->s[at] - '0';
+                b = h < sizeof half - 1 ? half[h] - '0' : 0;
+                if (d < 0) { /* the literal has no more digits: a smaller boundary digit still to come makes it smaller */
+                    for (; h < sizeof half - 1; h++) if (half[h] != '0') { cmp = -1; break; }
+                    break;
+                }
+                if (d != b) { cmp = d < b ? -1 : 1; break; }
+                at++;
+                h++;
             }
+            if (cmp >= 0) return rbli_jfail(p, "number out of range");
         }
     }
     if (cap) {

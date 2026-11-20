@@ -496,6 +496,10 @@ static const struct { const char* doc; int ok; } JSON_CORPUS[] = {
     {"1e-999", 1}, {"123456789012345678901234567890", 1},
     {"01", 0}, {"-01", 0}, {"00", 0}, {"1.", 0}, {"1.e5", 0}, {"-.5", 0}, {".5", 0}, {"1e", 0}, {"1.0e+", 0}, {"+1", 0},
     {"-", 0}, {"- 1", 0}, {"0x10", 0}, {"1e999", 0}, {"Infinity", 0}, {"NaN", 0},
+    /* revision 8 (section 8, point 9): a literal is refused only if its correctly rounded double is not finite */
+    {"1.7976931348623157e308", 1}, {"1.7976931348623158e308", 1}, {"1.797693134862315807e308", 1}, {"-1.797693134862315807e308", 1},
+    {"0.17976931348623158079e309", 1}, {"0.0017976931348623158079e311", 1}, {"1e308", 1}, {"9.99e307", 1}, {"1e-400", 1},
+    {"1.797693134862315808e308", 0}, {"-1.797693134862315808e308", 0}, {"1e400", 0}, {"-1e400", 0}, {"[0,{\"b\":1e400}]", 0},
     /* string escapes */
     {"\"\\u0041\"", 1}, {"\"\\u00E9\"", 1}, {"\"\\u0000\"", 0}, {"\"a\\u0000b\"", 0}, {"\"\\u00000\"", 0}, {"\"\\\\u0000\"", 1}, {"{\"\\u0000\":1}", 0},
     {"[\"\\u0000\"]", 0}, {"\"\\/\"", 1}, {"\"\\ud800\\udc00\"", 1},
@@ -531,6 +535,55 @@ TEST(json_matches_serde_json) {
             CHECK_EQ(json_accepts(objects), n <= 127);
             free(arrays); free(objects);
         }
+    }
+}
+
+/* Revision 8 (section 8, point 9): the boundary is 2^1024 - 2^970, written out in its 309 digits; a literal below it is
+ * finite as a double, one at or above it is not. Built around the boundary's digits, every spelling of each value. */
+TEST(numbers_are_refused_exactly_where_the_double_overflows) {
+    static const char half[] =
+        "179769313486231580793728971405303415079934132710037826936173778980444968292764750946649017977587207096330286416692"
+        "887910946555547851940402630657488671505820681908902000708383676273854845817711531764475730270069855571366959622842"
+        "914819860834936475292719074168444365510704342711559699508093042880177904174497792";
+    char below[400], doc[500];
+    size_t n = sizeof half - 1, i;
+    CHECK_EQ(n, 309);
+    memcpy(below, half, n + 1);
+    below[n - 1] = '1'; /* ...791: one below the boundary */
+    {   struct { const char* fmt; const char* digits; int ok; } c[] = {
+            {"%s", half, 0}, {"%s", below, 1}, {"-%s", half, 0}, {"-%s", below, 1},
+            {"%se0", half, 0}, {"%se0", below, 1}, {"%s0e-1", half, 0}, {"%s0e-1", below, 1},
+            {"%s.0", half, 0}, {"%s.0000000001", half, 0}, {"%s.9999999999", below, 1}, {"%s99999e-5", below, 1},
+            {"%s00000e-5", half, 0}, {"0.%se309", half, 0}, {"0.%se309", below, 1}, {"0.000%se312", half, 0},
+            {"0.000%se312", below, 1}, {"%s1e-1", below, 1},
+        };
+        for (i = 0; i < sizeof c / sizeof c[0]; i++) {
+            snprintf(doc, sizeof doc, c[i].fmt, c[i].digits);
+            if (json_accepts(doc) != c[i].ok) {
+                char m[600];
+                snprintf(m, sizeof m, "%s should be %s", doc, c[i].ok ? "accepted" : "refused");
+                t_fail(__FILE__, __LINE__, m);
+            }
+        }
+    }
+    /* the same with the decimal point inside: 17976.93...e304 */
+    snprintf(doc, sizeof doc, "%.5s.%se304", half, half + 5);
+    CHECK(!json_accepts(doc));
+    snprintf(doc, sizeof doc, "%.5s.%se304", below, below + 5);
+    CHECK(json_accepts(doc));
+    /* 10^309 (310 digits) is out of range, 10^308 is not */
+    doc[0] = '1'; memset(doc + 1, '0', 309); doc[310] = 0;
+    CHECK(!json_accepts(doc));
+    doc[309] = 0;
+    CHECK(json_accepts(doc));
+    /* a whole line with such a number in a field nobody reads */
+    {   rbl_control m;
+        const char* why;
+        char line[600];
+        snprintf(line, sizeof line, "{\"type\":\"despawn\",\"entity\":1,\"x\":%s}", below);
+        CHECK_EQ(rbl_control_parse(line, strlen(line), &m, &why), RBL_OK);
+        snprintf(line, sizeof line, "{\"type\":\"despawn\",\"entity\":1,\"x\":{\"a\":[0,%s]}}", half);
+        CHECK_EQ(rbl_control_parse(line, strlen(line), &m, &why), RBL_ERR_MALFORMED);
     }
 }
 
@@ -2980,6 +3033,7 @@ int main(void) {
     RUN(serial_arithmetic_and_negotiation);
     RUN(camera_helpers_and_quaternions);
     RUN(json_matches_serde_json);
+    RUN(numbers_are_refused_exactly_where_the_double_overflows);
     RUN(control_contract_examples_parse);
     RUN(control_broken_lines_are_protocol_errors);
     RUN(control_lines_round_trip);
