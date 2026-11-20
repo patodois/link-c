@@ -3312,6 +3312,52 @@ TEST(endpoint_reader_refuses_a_file_others_can_read) {
 }
 #endif
 
+/* Revision 8 (contract 9.6, item 5): on Windows a pixel file path is a drive-letter path, decided on the text before any
+ * file-system call. The rule is pure, so it is tested on every platform. */
+TEST(windows_pixel_paths_are_drive_letter_paths_only) {
+    static const char* const ok[] = {
+        "C:\\x\\a.frames", "c:/x/a.frames", "Z:\\a", "\\\\?\\C:\\x\\a.frames", "C:\\x\\COM10.frames", "C:\\x\\NULL.frames",
+        "C:\\x\\console.frames", "C:\\NUL\\a.frames", "C:\\x\\COM0", "C:\\x\\.nul",
+    };
+    static const char* const refused[] = {
+        "\\\\192.0.2.1\\rbl-vectors\\pixel.frames", "\\\\?\\UNC\\192.0.2.1\\s\\pixel.frames", "\\\\.\\pipe\\x",
+        "\\\\?\\GLOBALROOT\\Device\\Null", "\\\\.\\C:\\x\\a.frames", "//server/share/a.frames", "\\\\?\\C:/x/a.frames",
+        "C:\\rbl-vectors\\NUL.frames", "C:\\x\\nul", "C:\\x\\COM1.txt", "c:/x/lpt9", "C:\\x\\con .frames", "C:\\x\\Aux.a.b",
+        "C:\\x\\CONIN$", "C:\\x\\conout$.frames", "C:x\\a.frames", "x\\a.frames", "/tmp/a.frames", "", "1:\\a",
+    };
+    size_t i;
+    for (i = 0; i < sizeof ok / sizeof ok[0]; i++)
+        if (!rbl_pixel_path_allowed(ok[i], 1)) { char m[200]; snprintf(m, sizeof m, "%s should be allowed", ok[i]); t_fail(__FILE__, __LINE__, m); }
+    for (i = 0; i < sizeof refused / sizeof refused[0]; i++)
+        if (rbl_pixel_path_allowed(refused[i], 1)) { char m[200]; snprintf(m, sizeof m, "%s should be refused", refused[i]); t_fail(__FILE__, __LINE__, m); }
+    CHECK(!rbl_pixel_path_allowed(NULL, 1));
+    CHECK(rbl_pixel_path_allowed("/tmp/a.frames", 0));
+    CHECK(!rbl_pixel_path_allowed("a.frames", 0));
+#if RBLI_WINDOWS
+    {   /* the reader and the writer refuse at once, before the system could go to the network */
+        rbl_pixel_reader* r = NULL;
+        rbl_pixel_writer* w = NULL;
+        uint64_t t0 = rbli_mono_ms();
+        CHECK_EQ(rbl_pixel_reader_open("\\\\192.0.2.1\\rbl-test\\pixel.frames", &r), RBL_ERR_REFUSED);
+        CHECK_EQ(rbl_pixel_reader_open("\\\\.\\pipe\\rbl-test", &r), RBL_ERR_REFUSED);
+        CHECK(rbli_mono_ms() - t0 < 500);
+        CHECK_EQ(rbl_pixel_writer_create("\\\\192.0.2.1\\rbl-test\\pixel.frames", 4, 2, 3, 0, &w), RBL_ERR_REFUSED);
+        CHECK(w == NULL);
+    }
+    {   /* a temporary directory that is not on a local drive gives no pixel file */
+        wchar_t tmp[1024], temp[1024];
+        DWORD a = GetEnvironmentVariableW(L"TMP", tmp, 1024), b = GetEnvironmentVariableW(L"TEMP", temp, 1024);
+        rbl_pixel_writer* w = NULL;
+        SetEnvironmentVariableW(L"TMP", L"\\\\192.0.2.1\\rbl-test\\");
+        SetEnvironmentVariableW(L"TEMP", L"\\\\192.0.2.1\\rbl-test\\");
+        CHECK_EQ(rbl_pixel_writer_create_temp("t", 4, 2, 3, 0, &w), RBL_ERR_REFUSED);
+        CHECK(w == NULL);
+        SetEnvironmentVariableW(L"TMP", a > 0 && a < 1024 ? tmp : NULL);
+        SetEnvironmentVariableW(L"TEMP", b > 0 && b < 1024 ? temp : NULL);
+    }
+#endif
+}
+
 TEST(config_defaults_and_bad_tokens) {
     rbl_config c;
     rbl_link* l = NULL;
@@ -3776,6 +3822,7 @@ int main(void) {
 #if !RBLI_WINDOWS
     RUN(endpoint_reader_refuses_a_file_others_can_read);
 #endif
+    RUN(windows_pixel_paths_are_drive_letter_paths_only);
     RUN(config_defaults_and_bad_tokens);
     RUN(a_host_with_an_endpoint_file_writes_it_after_binding_and_removes_it_on_close);
     RUN(a_host_with_a_configured_token_writes_that_token_to_the_file);

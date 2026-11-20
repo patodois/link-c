@@ -666,6 +666,12 @@ RBLDEF int rbl_temp_dir(char* out, size_t cap);
  * letter, a colon and a separator, or two leading separators). The reader applies the rules of
  * the platform it runs on; both are exposed so they can be tested everywhere. */
 RBLDEF int rbl_path_is_absolute(const char* path, int windows_rules);
+/* Revision 8 (contract 9.6, item 5): whether a pixel file path has a form the reader of that platform looks up at all. Windows
+ * rules: a drive-letter path (X:\... or X:/...) or the same as \\?\X:\..., whose last component is not a device name (CON,
+ * PRN, AUX, NUL, COM1 to COM9, LPT1 to LPT9, with or without an extension); UNC and device paths fail, since looking one up
+ * makes Windows go to the network or open a device. Unix rules: an absolute path. On Windows the reader and the writer also
+ * refuse a drive that is not local (GetDriveType other than fixed or RAM disk). Text only: no file-system call. */
+RBLDEF int rbl_pixel_path_allowed(const char* path, int windows_rules);
 
 #ifdef __cplusplus
 }
@@ -3751,6 +3757,59 @@ RBLDEF int rbl_path_is_absolute(const char* path, int windows_rules) {
 
 static int rbli_path_abs_here(const char* path) { return rbl_path_is_absolute(path, RBLI_WINDOWS); }
 
+static int rbli_ascii_letter(char c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'); }
+
+/* Revision 8 (section 9.6, item 5): the only paths a pixel file may have on Windows, decided on the text alone, before any
+ * file-system call: a drive-letter path (X:\... or X:/...), or the same as \\?\X:\..., whose last component is not a name
+ * Windows reserves for a device (CON, PRN, AUX, NUL, CONIN$, CONOUT$, COM1 to COM9, LPT1 to LPT9, with or without an
+ * extension). UNC paths (\\server\share, \\?\UNC\...), device paths (\\.\..., \\?\GLOBALROOT\...) and every other form
+ * fail: merely looking one up makes Windows go to another machine with the user's credentials, or open a pipe or a device.
+ * Pure, and compiled everywhere so it is tested everywhere. */
+static int rbli_win_pixel_path_form(const char* path) { /* rbl_pixel_path_allowed with windows_rules */
+    static const char* const devices[] = { "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$" };
+    const char* p = path;
+    const char* last;
+    const char* q;
+    char base[8];
+    size_t n = 0, k;
+    if (!p) return 0;
+    if (p[0] == '\\' && p[1] == '\\' && p[2] == '?' && p[3] == '\\') {
+        p += 4; /* the verbatim form: only \\?\X:\ */
+        if (!rbli_ascii_letter(p[0]) || p[1] != ':' || p[2] != '\\') return 0;
+    } else if (!rbli_ascii_letter(p[0]) || p[1] != ':' || (p[2] != '\\' && p[2] != '/')) {
+        return 0;
+    }
+    last = p + 3;
+    for (q = last; *q; q++) if (*q == '\\' || *q == '/') last = q + 1;
+    /* the last component up to its first dot, without the spaces Windows drops before the dot */
+    for (q = last; *q && *q != '.'; q++) {
+        if (n == sizeof base) return 1; /* longer than any device name */
+        base[n++] = *q >= 'a' && *q <= 'z' ? (char)(*q - 'a' + 'A') : *q;
+    }
+    while (n > 0 && base[n - 1] == ' ') n--;
+    for (k = 0; k < sizeof devices / sizeof devices[0]; k++)
+        if (strlen(devices[k]) == n && memcmp(devices[k], base, n) == 0) return 0;
+    if (n == 4 && (memcmp(base, "COM", 3) == 0 || memcmp(base, "LPT", 3) == 0) && base[3] >= '1' && base[3] <= '9') return 0;
+    return 1;
+}
+
+RBLDEF int rbl_pixel_path_allowed(const char* path, int windows_rules) {
+    return windows_rules ? rbli_win_pixel_path_form(path) : rbl_path_is_absolute(path, 0);
+}
+
+#if RBLI_WINDOWS
+/* Revision 8 (section 9.6, item 5, a SHOULD): the drive of a path that passed rbli_win_pixel_path_form is a local one (fixed
+ * or a RAM disk), not a mapped network drive or removable media. Asking does not open anything on the drive. */
+static int rbli_win_local_drive(const char* path) {
+    wchar_t root[4];
+    UINT t;
+    if (path[0] == '\\') path += 4; /* \\?\X:\ */
+    root[0] = (wchar_t)(unsigned char)path[0]; root[1] = L':'; root[2] = L'\\'; root[3] = 0;
+    t = GetDriveTypeW(root);
+    return t == DRIVE_FIXED || t == DRIVE_RAMDISK;
+}
+#endif
+
 /* Checks a pixel file header (revision 5) against the file's length. size is the file length
  * in bytes. Returns RBL_OK or RBL_ERR_REFUSED. Pure: it reads only hdr[0..64). */
 static int rbli_pf_validate(const uint8_t* hdr, uint64_t size, rbl_pixel_info* info) {
@@ -3954,6 +4013,10 @@ RBLDEF int rbl_pixel_reader_open(const char* path, rbl_pixel_reader** out) {
     *out = NULL;
     if (!path) return RBL_ERR_ARGS;
     if (!rbli_path_abs_here(path)) return RBL_ERR_REFUSED; /* the path comes from the peer: it must be absolute */
+#if RBLI_WINDOWS
+    /* revision 8: only a drive-letter path on a local drive, decided before any file-system call on the path */
+    if (!rbli_win_pixel_path_form(path) || !rbli_win_local_drive(path)) return RBL_ERR_REFUSED;
+#endif
     r = (rbl_pixel_reader*)REWRITE_LINK_MALLOC(sizeof *r);
     if (!r) return RBL_ERR_NOMEM;
     memset(r, 0, sizeof *r);
@@ -3973,6 +4036,16 @@ RBLDEF int rbl_pixel_reader_open(const char* path, rbl_pixel_reader** out) {
                               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
         REWRITE_LINK_FREE(wp);
         if (r->file == INVALID_HANDLE_VALUE) { REWRITE_LINK_FREE(r); return RBL_ERR_IO; }
+        {   /* revision 8 (a MAY): a drive-letter path can still run through a directory link to a share; the final path of
+             * the opened handle tells. By now the system has been to the network, but nothing is read from there. */
+            wchar_t fin[16];
+            DWORD fn = GetFinalPathNameByHandleW(r->file, fin, (DWORD)(sizeof fin / sizeof fin[0]), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+            if (fn >= 8 && fin[0] == L'\\' && fin[1] == L'\\' && fin[2] == L'?' && fin[3] == L'\\' &&
+                (fin[4] == L'U' || fin[4] == L'u') && (fin[5] == L'N' || fin[5] == L'n') && (fin[6] == L'C' || fin[6] == L'c') &&
+                fin[7] == L'\\') {
+                CloseHandle(r->file); REWRITE_LINK_FREE(r); return RBL_ERR_REFUSED;
+            }
+        }
         if (GetFileType(r->file) != FILE_TYPE_DISK || !GetFileInformationByHandle(r->file, &bi) ||
             (bi.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DEVICE)) ||
             !GetFileSizeEx(r->file, &sz)) {
@@ -4231,6 +4304,10 @@ RBLDEF int rbl_pixel_writer_create(const char* path, uint32_t width, uint32_t he
     }
     if (!w->path) { REWRITE_LINK_FREE(w); return RBL_ERR_IO; }
 #if RBLI_WINDOWS
+    /* revision 8 (section 9.6): the file goes on a local drive, at a path a receiver opens, or there is no pixel channel */
+    if (!rbli_win_pixel_path_form(w->path) || !rbli_win_local_drive(w->path)) {
+        REWRITE_LINK_FREE(w->path); REWRITE_LINK_FREE(w); return RBL_ERR_REFUSED;
+    }
     w->wpath = rbli_widen(w->path);
     if (!w->wpath) { REWRITE_LINK_FREE(w->path); REWRITE_LINK_FREE(w); return RBL_ERR_ARGS; }
     /* CREATE_NEW: creation fails if the path exists, so it never opens over another file. Both sides
