@@ -430,7 +430,8 @@ typedef struct rbl_link rbl_link;
 typedef struct rbl_config {
     const char* game;            /* this side's game, sent in hello (copied, at most 255 bytes used) */
     uint16_t control_port;       /* host: TCP port to listen on (0 = any free port); guest: the host's port */
-    uint16_t udp_port;           /* this side's UDP port (0 = any free port), announced in hello */
+    uint16_t udp_port;           /* this side's UDP port, announced in hello. 0 = any free port, and (revision 8) a new one for
+                                    each session: the socket of a session is connected to the peer and never disconnected */
     uint32_t heartbeat_ms;       /* heartbeat period; 0 = the default (250), otherwise clamped to 10..10000 */
     uint32_t timeout_ms;         /* own watchdog timeout, 0 = the default (2000); the effective one is max(this, 4 * peer heartbeat) */
     uint32_t reconnect_ms;       /* guest: how often to retry connecting while no host answers */
@@ -502,7 +503,8 @@ typedef struct rbl_stats {
     uint64_t datagrams_sent, datagrams_received;
     uint64_t malformed;      /* datagrams that failed validation */
     uint64_t stale;          /* late or out-of-order state that was dropped */
-    uint64_t foreign;        /* datagrams from another address or session (one of another version is malformed) */
+    uint64_t foreign;        /* datagrams read from another address or session (one of another version is malformed); while a
+                                session is live the socket is connected and the system drops other addresses' unread */
     uint64_t send_dropped;   /* datagrams the OS would not take */
     uint64_t lines_sent, lines_received;
     uint64_t unknown_entity; /* pose records for an entity the peer never spawned */
@@ -561,7 +563,7 @@ RBLDEF void rbl_link_close(rbl_link* link);
 
 RBLDEF rbl_role rbl_link_role(const rbl_link* link);
 RBLDEF uint16_t rbl_link_control_port(const rbl_link* link); /* host: the port actually bound */
-RBLDEF uint16_t rbl_link_udp_port(const rbl_link* link);
+RBLDEF uint16_t rbl_link_udp_port(const rbl_link* link); /* the port of this session, or of the next one (revision 8) */
 RBLDEF int rbl_link_is_connected(const rbl_link* link);
 /* Copies the peer's info; returns 0 if there is no session. */
 RBLDEF int rbl_link_peer(const rbl_link* link, rbl_peer_info* out);
@@ -1105,8 +1107,9 @@ static rbli_sock rbli_tcp_accept(rbli_sock listener) {
     return s;
 }
 
-/* Receives one datagram; returns its length, -1 if none is waiting, -2 on a (skippable) error.
- * *addr and *port get the source. */
+/* Receives one datagram; returns its length, -1 if none is waiting, -2 on a (skippable) error: an unreachable peer port
+ * (ECONNREFUSED, WSAECONNRESET, which a connected socket reports for an earlier send) is a lost datagram, not the end of the
+ * session (revision 8, section 2). *addr and *port get the source. */
 static int rbli_udp_recv(rbli_sock s, uint8_t* buf, size_t cap, uint32_t* addr, uint16_t* port) {
     struct sockaddr_in a;
     socklen_t al = (socklen_t)sizeof a;
@@ -1114,11 +1117,20 @@ static int rbli_udp_recv(rbli_sock s, uint8_t* buf, size_t cap, uint32_t* addr, 
     if (r >= 0) { *addr = ntohl(a.sin_addr.s_addr); *port = ntohs(a.sin_port); return r; }
     return rbli_would_block(rbli_os_errno()) ? -1 : -2;
 }
-/* 1 sent, 0 the OS would not take it */
-static int rbli_udp_send(rbli_sock s, const uint8_t* buf, size_t n, uint16_t port) {
+/* 1 sent, 0 the OS would not take it (would block, an unreachable port: a lost datagram either way). A socket connected to the
+ * peer uses send: macOS and the BSDs refuse a destination on a connected socket (EISCONN). */
+static int rbli_udp_send_to(rbli_sock s, int connected, const uint8_t* buf, size_t n, uint16_t port) {
     struct sockaddr_in a;
+    if (connected) return send(s, (const char*)buf, (int)n, 0) >= 0 ? 1 : 0;
     rbli_loopback(&a, port);
     return sendto(s, (const char*)buf, (int)n, 0, (struct sockaddr*)&a, sizeof a) >= 0 ? 1 : 0;
+}
+/* Revision 8 (section 2): has the system deliver only 127.0.0.1:port's datagrams to s from now on. 1 if it did. Never undone:
+ * dissolving the association rebinds the socket to every address on macOS and releases an automatic port on Linux. */
+static int rbli_udp_connect(rbli_sock s, uint16_t port) {
+    struct sockaddr_in a;
+    rbli_loopback(&a, port);
+    return connect(s, (struct sockaddr*)&a, sizeof a) == 0;
 }
 
 /* Exactly 127.0.0.1 and the peer's announced UDP port (CONTRACT.md 2): not another loopback
@@ -2163,6 +2175,7 @@ struct rbl_link {
     uint32_t heartbeat_ms;
     rbli_sock udp, listener;
     uint16_t udp_port, control_port;
+    int udp_connected;   /* revision 8: udp is connected to the peer's address of the session (or of the last one) */
     int net_up;
 
     rbli_state state;    /* a host is IDLE (with its candidates) or LIVE; a guest goes IDLE, CONNECTING, HANDSHAKE, LIVE */
@@ -2563,6 +2576,21 @@ static void rbli_reset_session(rbl_link* l) {
     rbli_asm_clear(l);
 }
 
+/* Revision 8 (section 2): after a session on a socket the system gave an automatic port (udp_port 0 configured), a new socket
+ * on a new automatic port, so that the old one never has to be disconnected; the next hello announces the new port. A socket
+ * on a fixed port is kept, and the next session connects it again. If no new socket can be had, the old one is kept too. */
+static void rbli_renew_udp(rbl_link* l) {
+    uint16_t port = 0;
+    rbli_sock s;
+    if (l->cfg.udp_port != 0 || !l->udp_connected) return;
+    s = rbli_udp_open(0, &port);
+    if (s == RBLI_BAD_SOCK) return;
+    rbli_sock_close(l->udp);
+    l->udp = s;
+    l->udp_port = port;
+    l->udp_connected = 0;
+}
+
 /* Ends the current connection, reporting it as lost (or as a failed handshake). */
 static void rbli_end(rbl_link* l, const char* reason, int bye) {
     uint64_t now = rbli_mono_ms();
@@ -2574,6 +2602,7 @@ static void rbli_end(rbl_link* l, const char* reason, int bye) {
     l->next_try = l->role == RBL_ROLE_GUEST ? now + l->cfg.reconnect_ms : now;
     if (had_ctl) rbli_retire_ctl(l, bye ? text : NULL, now);
     rbli_reset_session(l);
+    if (was_live) rbli_renew_udp(l);
     rbli_report_end(l, was_live, text);
 }
 
@@ -2596,7 +2625,7 @@ static int rbli_live_header(rbl_link* l, rbl_header* h) {
 /* Sends l->tx[0..len) to the peer and takes the next seq. Returns the seq used. */
 static uint32_t rbli_emit(rbl_link* l, int len) {
     uint32_t s = l->seq++;
-    if (rbli_udp_send(l->udp, l->tx, (size_t)len, l->peer.udp_port)) l->stats.datagrams_sent++;
+    if (rbli_udp_send_to(l->udp, l->udp_connected, l->tx, (size_t)len, l->peer.udp_port)) l->stats.datagrams_sent++;
     else l->stats.send_dropped++; /* refused or would block: the next tick replaces it */
     return s;
 }
@@ -2786,6 +2815,10 @@ static int rbli_on_hello(rbl_link* l, const rbl_control* c, uint64_t now, char* 
     l->state = RBLI_LIVE;
     l->last_heard = now;
     l->last_beat = now;
+    /* revision 8 (section 2): the system drops other senders' datagrams before they cost a read. Best effort: a socket that
+     * cannot be connected stays as it was, and the address rule and the per-poll bound still hold. A socket connected for an
+     * earlier session is connected again, to this peer. */
+    l->udp_connected = rbli_udp_connect(l->udp, l->peer.udp_port);
     {
         rbl_event* e = rbli_ev_push(l, RBL_EV_CONNECTED);
         if (e) e->u.connected = l->peer;
@@ -3165,9 +3198,14 @@ static void rbli_on_datagram(rbl_link* l, const rbl_decoded* d) {
     }
 }
 
+/* Revision 8 (section 2): datagrams read per poll, at the contract's reference values. Without a session none of them can be
+ * the peer's; with one, the bound is the backstop where the socket cannot be connected. The rest stay in the socket's buffer. */
+#define RBLI_DATAGRAMS_PER_POLL 1024
+#define RBLI_DATAGRAMS_WITHOUT_SESSION 64
+
 static void rbli_poll_udp(rbl_link* l, uint64_t now) {
-    int n;
-    for (n = 0; n < 4096; n++) {
+    int n, budget = l->state == RBLI_LIVE ? RBLI_DATAGRAMS_PER_POLL : RBLI_DATAGRAMS_WITHOUT_SESSION;
+    for (n = 0; n < budget; n++) {
         uint32_t addr = 0;
         uint16_t port = 0;
         int len;
@@ -3175,7 +3213,7 @@ static void rbli_poll_udp(rbl_link* l, uint64_t now) {
         if (!rbli_room(l)) break; /* leave the rest in the socket buffer */
         len = rbli_udp_recv(l->udp, l->rx, sizeof l->rx, &addr, &port);
         if (len == -1) break;
-        if (len == -2) continue; /* e.g. ICMP port-unreachable from an earlier send */
+        if (len == -2) continue; /* an unreachable peer port (ICMP from an earlier send), or another error: one of the budget */
         if (l->state != RBLI_LIVE) { l->stats.foreign++; continue; }
         if (!rbli_is_peer_addr(addr, port, l->peer.udp_port)) { l->stats.foreign++; continue; }
         if ((size_t)len < RBL_HEADER_LEN || rbli_get32(l->rx) != RBL_MAGIC || rbli_get16(l->rx + 4) != RBL_VERSION) {

@@ -46,6 +46,9 @@
 #define REWRITE_LINK_IMPLEMENTATION
 #include "../rewrite_link.h"
 
+/* an unconnected socket's send, as the raw peers here use it */
+#define rbli_udp_send(s, buf, n, port) rbli_udp_send_to((s), 0, (buf), (n), (port))
+
 #if RBLI_WINDOWS
 #include <winioctl.h>
 #endif

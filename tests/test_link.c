@@ -66,6 +66,9 @@ static int test_lstat(const char* path, struct stat* st) {
 #define REWRITE_LINK_IMPLEMENTATION
 #include "../rewrite_link.h"
 
+/* an unconnected socket's send, as the raw peers here use it */
+#define rbli_udp_send(s, buf, n, port) rbli_udp_send_to((s), 0, (buf), (n), (port))
+
 #if !RBLI_WINDOWS
 #include <dirent.h>
 #include <pthread.h>
@@ -1614,7 +1617,18 @@ TEST(close_returns_within_the_linger_even_if_the_peer_never_closes) {
     raw_close(&r);
 }
 
-TEST(datagrams_from_another_address_are_dropped) {
+/* The port a UDP socket is connected to, or 0. */
+static uint16_t udp_peer_port(rbli_sock s) {
+    struct sockaddr_in a;
+    socklen_t n = (socklen_t)sizeof a;
+    memset(&a, 0, sizeof a);
+    if (getpeername(s, (struct sockaddr*)&a, &n) != 0) return 0;
+    return ntohl(a.sin_addr.s_addr) == 0x7F000001u ? ntohs(a.sin_port) : 0;
+}
+
+/* Revision 8 (section 2): during a session each side's UDP socket is connected to the peer's address, so the system drops a
+ * stranger's datagrams before they are queued (the address rule would drop them too, after a read). */
+TEST(datagrams_from_another_address_are_dropped_by_the_connected_socket) {
     Pair p;
     rbli_sock stranger;
     uint16_t sport;
@@ -1625,19 +1639,161 @@ TEST(datagrams_from_another_address_are_dropped) {
     int n, ok;
     rbl_stats before;
     REQUIRE(pair_open(&p));
+    CHECK_EQ(udp_peer_port(p.host->udp), rbl_link_udp_port(p.guest));
+    CHECK_EQ(udp_peer_port(p.guest->udp), rbl_link_udp_port(p.host));
     rbl_link_peer(p.host, &hp);
     stranger = rbli_udp_open(0, &sport);
     REQUIRE(stranger != RBLI_BAD_SOCK);
+    CHECK_EQ(rbl_link_spawn(p.guest, 1, "P", "a", NULL), RBL_OK);
+    WAIT_UNTIL(1000, pair_pump(&p), p.hc.spawns == 1, ok);
     rbl_pose_identity(&pose, 1, rbl_now_us());
     h = mk_header(hp.session, 1, rbl_now_us());
     n = rbl_wire_encode_poses(&h, &pose, 1, b, sizeof b);
     before = stats_of(p.host);
     CHECK(rbli_udp_send(stranger, b, (size_t)n, rbl_link_udp_port(p.host)));
-    WAIT_UNTIL(500, pair_pump(&p), stats_of(p.host).foreign > before.foreign, ok);
-    CHECK(ok);
-    CHECK_EQ(p.hc.pose_events, 0);
+    WAIT_UNTIL(300, pair_pump(&p), p.hc.pose_events > 0, ok);
+    CHECK(!ok);
+    CHECK_EQ(stats_of(p.host).foreign, before.foreign); /* never read: the system dropped it */
     rbli_sock_close(stranger);
     pair_close(&p);
+}
+
+/* Revision 8 (section 2): a socket on an automatic port is replaced when its session ends, so it is never disconnected; the
+ * next hello announces the new port. A socket on a fixed port is kept and connected again to the next peer. */
+TEST(an_automatic_udp_port_is_a_new_socket_for_each_session_and_a_fixed_one_is_connected_again) {
+    int fixed;
+    for (fixed = 0; fixed < 2; fixed++) {
+        rbl_config h, g;
+        Pair p;
+        uint16_t hp1, gp1, free_port = 0;
+        rbl_peer_info hi, gi;
+        rbl_camera cam;
+        float eye[3] = {0, 0, 0}, tgt[3] = {0, 0, -1};
+        int ok, tries;
+        if (fixed) { rbli_sock t = rbli_udp_open(0, &free_port); REQUIRE(t != RBLI_BAD_SOCK); rbli_sock_close(t); }
+        rbl_config_init(&h, "H"); h.control_port = 0; h.udp_port = free_port; h.timeout_ms = 4000;
+        rbl_config_init(&g, "G"); g.timeout_ms = 4000; g.reconnect_ms = 50;
+        REQUIRE(pair_open_cfg(&p, &h, &g));
+        hp1 = rbl_link_udp_port(p.host);
+        gp1 = rbl_link_udp_port(p.guest);
+        rbl_link_disconnect(p.guest, "next session");
+        WAIT_UNTIL(2000, pair_pump(&p), p.hc.lost > 0, ok);
+        REQUIRE(ok);
+        if (fixed) CHECK_EQ(rbl_link_udp_port(p.host), hp1);
+        else CHECK(rbl_link_udp_port(p.host) != hp1);
+        CHECK(rbl_link_udp_port(p.guest) != gp1); /* the guest's port was automatic */
+        WAIT_UNTIL(3000, pair_pump(&p), rbl_link_is_connected(p.host) && rbl_link_is_connected(p.guest), ok);
+        REQUIRE(ok);
+        REQUIRE(rbl_link_peer(p.host, &hi) && rbl_link_peer(p.guest, &gi));
+        CHECK_EQ(hi.udp_port, rbl_link_udp_port(p.guest)); /* each hello announced the port of the new session */
+        CHECK_EQ(gi.udp_port, rbl_link_udp_port(p.host));
+        CHECK_EQ(udp_peer_port(p.host->udp), rbl_link_udp_port(p.guest));
+        rbl_camera_look_at(&cam, eye, tgt, 1.0f, 0.1f, 10.0f, 8, 8);
+        for (ok = 0, tries = 0; !ok && tries < 10; tries++) { /* and datagrams flow both ways */
+            CHECK_EQ(rbl_link_send_camera(p.host, &cam, NULL), RBL_OK);
+            CHECK_EQ(rbl_link_send_camera(p.guest, &cam, NULL), RBL_OK);
+            WAIT_UNTIL(200, pair_pump(&p), p.gc.cameras > 0 && p.hc.cameras > 0, ok);
+        }
+        CHECK(ok);
+        pair_close(&p);
+    }
+}
+
+/* Revision 8 (section 2): at most 64 datagrams are read per poll without a session and 1024 with one; the rest wait in the
+ * socket's buffer for the next poll. */
+TEST(datagrams_read_per_poll_are_bounded) {
+    rbl_config h;
+    rbl_link* host;
+    static Raw r;
+    Col c;
+    uint8_t b[64];
+    rbl_header hd;
+    rbl_stats s0, s1, s2;
+    char line[400];
+    rbl_control m;
+    const char* why;
+    uint32_t i;
+    int n, sent = 0;
+    memset(&c, 0, sizeof c);
+    rbl_config_init(&h, "H"); h.control_port = 0; h.timeout_ms = 10000;
+    REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
+    REQUIRE(raw_open(&r, rbl_link_control_port(host)));
+    /* no session: 100 datagrams, 64 read and dropped in one poll */
+    hd = mk_header(1, 0, 0);
+    n = rbl_wire_encode_heartbeat(&hd, b, sizeof b);
+    for (i = 0; i < 100; i++) sent += rbli_udp_send(r.udp, b, (size_t)n, rbl_link_udp_port(host));
+    REQUIRE(sent == 100);
+    rbli_sleep_ms(50);
+    s0 = stats_of(host);
+    col_poll(host, &c);
+    s1 = stats_of(host);
+    CHECK_EQ(s1.foreign - s0.foreign, 64);
+    col_poll(host, &c);
+    CHECK_EQ(stats_of(host).foreign - s0.foreign, 100);
+    /* a session: 1100 heartbeats from the peer, at most 1024 in one poll */
+    hello_line(line, sizeof line, "guest", 1, 1, r.udp_port, 250);
+    raw_send(&r, line);
+    REQUIRE(raw_wait_line(&r, host, &c, 2000, line, sizeof line));
+    REQUIRE(parse_line(line, &m, &why) == RBL_OK && m.type == RBL_CTL_HELLO);
+    for (i = 0; i < 1100; i++) {
+        hd = mk_header(m.u.hello.session, i, 0);
+        n = rbl_wire_encode_heartbeat(&hd, b, sizeof b);
+        rbli_udp_send(r.udp, b, (size_t)n, rbl_link_udp_port(host));
+    }
+    rbli_sleep_ms(100);
+    s0 = stats_of(host);
+    col_poll(host, &c);
+    s1 = stats_of(host);
+    col_poll(host, &c);
+    s2 = stats_of(host);
+    CHECK(s1.datagrams_received - s0.datagrams_received <= 1024);
+    /* where the system's buffer held more than 1024 (macOS grants the 4 MiB asked for; Linux about 200 KiB), the first poll
+     * read exactly 1024 and the second the rest */
+    if (s2.datagrams_received - s0.datagrams_received > 1024) CHECK_EQ(s1.datagrams_received - s0.datagrams_received, 1024);
+#if defined(__APPLE__)
+    CHECK_EQ(s2.datagrams_received - s0.datagrams_received, 1100);
+#endif
+    CHECK(rbl_link_is_connected(host));
+    raw_close(&r);
+    rbl_link_close(host);
+}
+
+/* Revision 8 (section 2): an error that a connected socket reports because the peer's port is unreachable is a lost datagram;
+ * the watchdog decides whether the peer is gone. */
+TEST(an_unreachable_peer_udp_port_loses_datagrams_not_the_session) {
+    rbl_config h;
+    rbl_link* host;
+    static Raw r;
+    Col c;
+    char line[400];
+    rbl_camera cam;
+    float eye[3] = {0, 0, 0}, tgt[3] = {0, 0, -1};
+    uint64_t end;
+    rbl_stats s0;
+    memset(&c, 0, sizeof c);
+    rbl_config_init(&h, "H"); h.control_port = 0; h.timeout_ms = 1000; h.heartbeat_ms = 20;
+    REQUIRE(rbl_link_host(&h, &host) == RBL_OK);
+    REQUIRE(raw_open(&r, rbl_link_control_port(host)));
+    hello_line(line, sizeof line, "guest", 1, 1, r.udp_port, 250);
+    raw_send(&r, line);
+    REQUIRE(raw_wait_line(&r, host, &c, 2000, line, sizeof line));
+    rbli_sock_close(r.udp); /* the peer's UDP port goes away during the session */
+    r.udp = RBLI_BAD_SOCK;
+    rbl_camera_look_at(&cam, eye, tgt, 1.0f, 0.1f, 10.0f, 8, 8);
+    s0 = stats_of(host);
+    end = rbli_mono_ms() + 600;
+    while (rbli_mono_ms() < end) { /* the peer stays alive on the control channel (an unknown type counts) */
+        raw_send(&r, "{\"type\":\"still_here\"}\n");
+        CHECK_EQ(rbl_link_send_camera(host, &cam, NULL), RBL_OK);
+        col_poll(host, &c);
+        raw_pump(&r);
+        rbli_sleep_ms(20);
+    }
+    CHECK_EQ(c.lost, 0);
+    CHECK(rbl_link_is_connected(host));
+    CHECK(stats_of(host).datagrams_sent + stats_of(host).send_dropped > s0.datagrams_sent + s0.send_dropped + 20);
+    raw_close(&r);
+    rbl_link_close(host);
 }
 
 TEST(a_datagram_of_another_version_from_the_peer_is_malformed_not_foreign) {
@@ -3572,7 +3728,10 @@ int main(void) {
     RUN(a_bye_that_arrived_wins_over_a_later_control_write_error);
     RUN(a_peer_that_stops_reading_the_control_channel_is_lost_above_1_mib);
     RUN(game_and_reason_are_cut_at_a_utf8_boundary);
-    RUN(datagrams_from_another_address_are_dropped);
+    RUN(datagrams_from_another_address_are_dropped_by_the_connected_socket);
+    RUN(an_automatic_udp_port_is_a_new_socket_for_each_session_and_a_fixed_one_is_connected_again);
+    RUN(datagrams_read_per_poll_are_bounded);
+    RUN(an_unreachable_peer_udp_port_loses_datagrams_not_the_session);
     RUN(a_datagram_of_another_version_from_the_peer_is_malformed_not_foreign);
     RUN(peer_address_must_be_127_0_0_1_and_the_announced_port);
     RUN(pixel_file_colour_only_round_trip);
