@@ -1,4 +1,4 @@
-# link-c
+<h1 align="center"><img src="docs/title.png" alt="link-c" width="255"></h1>
 
 link-c is a single-header C99 library for C and C++ game-plugin developers to connect games as hosts or guests through the rewrite-bridge passthrough link protocol.
 
